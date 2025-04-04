@@ -101,15 +101,42 @@ def format_metadata_embed(data, message, attachment):
             embed.title = "ComfyUI Parameters"
             for i, d in enumerate(comfyui_get_data(data)):
                 embed.add_field(name=f"{d['type']} {i+1}", value=d['val'][:1024], inline=True)
-        else:  # NovelAI/Swarm
-            embed.title = "Generated Image Parameters"
-            params = json.loads(data)
-            if "sui_image_params" in params:
-                extra = {k: str(v) for k,v in params.pop("sui_image_params").items()}
-                params.update(extra)
-            for k,v in params.items():
-                if k not in ("Comment", "Description"):
-                    embed.add_field(name=k, value=f"```{str(v)[:1000]}```", inline='prompt' not in k)
+        else:  # NovelAI/Swarm - Use logic similar to on_raw_reaction_add
+            x = json.loads(data)
+            if "sui_image_params" in x.keys():
+                t = x['sui_image_params'].copy()
+                del x['sui_image_params']
+                for key in t:
+                    t[key] = str(t[key])
+                x = x|t
+                embed.title = "Swarm Parameters"
+            else:
+                embed.title = "Nai Parameters"
+            if "Comment" in x.keys():
+                try: # Add try-except for Comment parsing
+                    t = x['Comment'].replace(r'\"', '"')
+                    t = json.loads(t)
+                    for key in t:
+                        t[key] = str(t[key])
+                    x = x | t
+                    del x['Comment']
+                    if 'Description' in x: # Remove Description only if Comment was successfully parsed
+                        del x['Description']
+                except json.JSONDecodeError:
+                    logger.warning("Could not parse 'Comment' field as JSON.")
+                    # Keep original Comment field if parsing fails
+            
+            i = 0
+            for k in x.keys():
+                i += 1
+                if i >= 25: # Limit fields
+                    embed.add_field(name="...", value="Too many fields to display.", inline=False)
+                    break
+                inline = 'prompt' not in k.lower() # Case-insensitive check for prompt
+                value_str = str(x[k])
+                if len(value_str) > 1000:
+                    value_str = value_str[:997] + '...'
+                embed.add_field(name=k, value=f"```\n{value_str}\n```", inline=inline)
     
     embed.set_image(url=attachment.url)
     embed.set_footer(text=f"Posted by {message.author}", icon_url=message.author.display_avatar)

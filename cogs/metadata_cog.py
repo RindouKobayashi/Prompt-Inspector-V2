@@ -3,6 +3,7 @@ import asyncio
 import gzip
 import json
 import os
+import traceback
 from collections import OrderedDict
 from pathlib import Path
 import gradio_client
@@ -124,7 +125,7 @@ async def read_info_from_image_stealth(image: Image.Image):
                         mode = "alpha"
                         if decoded_sig == "stealth_pngcomp":
                             compressed = True
-                        buffer_a = ""
+                        buffer_a = [] # Reset to list
                         index_a = 0
                     else:
                         read_end = True
@@ -141,24 +142,23 @@ async def read_info_from_image_stealth(image: Image.Image):
                         mode = "rgb"
                         if decoded_sig == "stealth_rgbcomp":
                             compressed = True
-                        buffer_rgb = ""
+                        buffer_rgb = [] # Reset to list
                         index_rgb = 0
             elif reading_param_len:
                 if mode == "alpha":
                     if index_a == 32:
-                        param_len = int(buffer_a, 2)
+                        param_len = int("".join(buffer_a), 2) # Join list before int conversion
                         reading_param_len = False
                         reading_param = True
-                        buffer_a = ""
+                        buffer_a = [] # Reset to list
                         index_a = 0
                 else:
                     if index_rgb == 33:
-                        pop = buffer_rgb[-1]
-                        buffer_rgb = buffer_rgb[:-1]
-                        param_len = int(buffer_rgb, 2)
+                        pop = buffer_rgb.pop() # Use pop() for list
+                        param_len = int("".join(buffer_rgb), 2) # Join list before int conversion
                         reading_param_len = False
                         reading_param = True
-                        buffer_rgb = pop
+                        buffer_rgb = [pop] # Reset to list containing the popped item
                         index_rgb = 1
             elif reading_param:
                 if mode == "alpha":
@@ -227,9 +227,12 @@ async def read_attachment_metadata(i: int, attachment: Attachment, metadata: Ord
             else:
                 info = await read_info_from_image_stealth(img)
             if info:
-                metadata[i] = info
+                if info:
+                    metadata[i] = info # Add to dict only if info was found
     except Exception as error:
-        print(f"{type(error).__name__}: {error}")
+        # Log the error more informatively
+        print(f"Error reading metadata for attachment {i} ({attachment.filename}): {type(error).__name__}: {error}")
+        print(traceback.format_exc()) # Print full traceback
 
 class MetadataCog(commands.Cog):
     def __init__(self, bot):
