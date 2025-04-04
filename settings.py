@@ -126,3 +126,6 @@ LOGGING_CONFIG = {
 logger = logging.getLogger("bot")
 
 dictConfig(LOGGING_CONFIG)
+
+# Prompt Inspector monitored channels
+monitored_channels = [int(x) for x in os.getenv('MONITORED_CHANNELS', '').split(',') if x]

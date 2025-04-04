@@ -3,6 +3,7 @@ import settings
 import asyncio
 from discord.ext import commands
 from settings import logger
+from context_menus import image_metadata_context_menu 
 
 
 # Discord Bot Permission
@@ -20,6 +21,9 @@ async def on_ready():
         if cog_file.name != "__init__.py":
             await bot.load_extension(f"cogs.{cog_file.name[:-3]}")
             logger.info(f"Loaded cog: {cog_file.name}")
+
+    # Loading context menus
+    image_metadata_context_menu.setup_contextmenu(bot)
 
     
 async def shutdown_tasks():

@@ -1,0 +1,51 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import settings
+from settings import logger
+
+class CommandsCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="toggle_channel")
+    @app_commands.default_permissions(manage_messages=True)
+    async def toggle_channel(self, interaction: discord.Interaction, channel_id: str = None):
+        """Adds/Removes a channel to the list of monitored channels"""
+        if not interaction.user.guild_permissions.manage_messages:
+            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+            return
+            
+        try:
+            channel_id = int(channel_id) if channel_id else interaction.channel_id
+            if channel_id in settings.monitored_channels:
+                settings.monitored_channels.remove(channel_id)
+                await interaction.response.send_message(f"Removed {channel_id} from the list of monitored channels.", ephemeral=True)
+            else:
+                settings.monitored_channels.append(channel_id)
+                await interaction.response.send_message(f"Added {channel_id} to the list of monitored channels.", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("Invalid channel ID.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"{type(e).__name__}: {e}")
+            await interaction.response.send_message("Internal bot error, please contact the bot owner.", ephemeral=True)
+
+    @app_commands.command(name="status")
+    async def status(self, interaction: discord.Interaction):
+        """Get the status of the VM/bot"""
+        if interaction.user.id != settings.BOT_OWNER_ID:
+            await interaction.response.send_message("You are not allowed to run this command.", ephemeral=True)
+            return
+        try:
+            import psutil
+            embed = discord.Embed(title="Status", color=0x00ff00)
+            embed.add_field(name="CPU Usage", value=f"{psutil.cpu_percent()}%")
+            embed.add_field(name="RAM Usage", value=f"{psutil.virtual_memory().percent}%")
+            embed.add_field(name="Disk Usage", value=f"{psutil.disk_usage('/').percent}%")
+            embed.set_footer(text="Stupid bot.", icon_url=interaction.user.display_avatar)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except ImportError:
+            await interaction.response.send_message("Status monitoring not available (psutil not installed)", ephemeral=True)
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(CommandsCog(bot))
