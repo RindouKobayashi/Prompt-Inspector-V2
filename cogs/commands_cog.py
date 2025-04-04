@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import settings
-from settings import logger
+from settings import logger, generate_content
 
 class CommandsCog(commands.Cog):
     def __init__(self, bot):
@@ -32,7 +32,7 @@ class CommandsCog(commands.Cog):
 
     @app_commands.command(name="status")
     async def status(self, interaction: discord.Interaction):
-        """Get the status of the VM/bot"""
+        """Get the status of the VM/bot."""
         if interaction.user.id != settings.BOT_OWNER_ID:
             await interaction.response.send_message("You are not allowed to run this command.", ephemeral=True)
             return
@@ -42,10 +42,67 @@ class CommandsCog(commands.Cog):
             embed.add_field(name="CPU Usage", value=f"{psutil.cpu_percent()}%")
             embed.add_field(name="RAM Usage", value=f"{psutil.virtual_memory().percent}%")
             embed.add_field(name="Disk Usage", value=f"{psutil.disk_usage('/').percent}%")
-            embed.set_footer(text="Stupid bot.", icon_url=interaction.user.display_avatar)
+            embed.set_footer(text="migus? plapped.", icon_url=interaction.user.display_avatar)
             await interaction.response.send_message(embed=embed, ephemeral=True)
         except ImportError:
             await interaction.response.send_message("Status monitoring not available (psutil not installed)", ephemeral=True)
+
+    @app_commands.command(name="summarize")
+    @app_commands.describe(
+        message_count="Number of messages to summarize (default: 10)",
+        ephemeral="Whether to show summary privately (default: True)"
+    )
+    async def summarize_chat(
+        self,
+        interaction: discord.Interaction,
+        message_count: int = 10,
+        ephemeral: bool = True
+    ):
+        """Summarize recent messages in this channel"""
+        await interaction.response.defer(ephemeral=ephemeral)
+        
+        try:
+            # Fetch and sort messages
+            messages = []
+            async for msg in interaction.channel.history(limit=message_count):
+                if not msg.author.bot and msg.content:
+                    messages.append(msg)
+            
+            messages.sort(key=lambda m: m.created_at)
+            
+            if not messages:
+                await interaction.followup.send("No messages found to summarize", ephemeral=ephemeral)
+                return
+            
+            # Prepare context for summarization
+            context = "\n".join(
+                f"{msg.author.display_name} ({msg.created_at.strftime('%H:%M')}): {msg.content}"
+                for msg in messages
+            )
+            
+            # Generate summary
+            prompt = f"""Summarize this conversation in 3-5 bullet points:
+            {context}"""
+            
+            response = generate_content(prompt)
+            summary = response.text
+            
+            # Format and send response
+            embed = discord.Embed(
+                title=f"Summary of last {len(messages)} messages",
+                description=summary,
+                color=discord.Color.blurple()
+            )
+            embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+            
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+            
+        except Exception as e:
+            logger.error(f"Summarization error: {e}")
+            await interaction.followup.send(
+                "Failed to generate summary. Please try again later.",
+                ephemeral=ephemeral
+            )
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(CommandsCog(bot))

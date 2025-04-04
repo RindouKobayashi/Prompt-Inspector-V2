@@ -55,6 +55,13 @@ SAFETY_SETTINGS = [
 ]
 CHAT = client.chats.create(model="gemini-2.0-flash-exp", history=chat_history, config={"response_modalities": ["TEXT", "IMAGE"]})
 
+def generate_content(prompt):
+    """Single-shot content generation"""
+    return client.models.generate_content(
+        model="gemini-2.0-flash-exp",
+        contents=[prompt]
+    )
+
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID"))
 
 class ColoredFormatter(logging.Formatter):
