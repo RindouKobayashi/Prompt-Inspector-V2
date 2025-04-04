@@ -78,16 +78,16 @@ def get_embed(embed_dict, context: Message):
     embed.set_footer(text=f'Posted by {context.author} - woof~', icon_url=context.author.display_avatar)
     return embed
 
-def read_info_from_image_stealth(image: Image.Image):
+async def read_info_from_image_stealth(image: Image.Image):
     """Read stealth PNGInfo"""
     width, height = image.size
     pixels = image.load()
-    has_alpha = True if image.mode == "RGBA" else False
+    has_alpha = image.mode == "RGBA"
     mode = None
     compressed = False
-    binary_data = ""
-    buffer_a = ""
-    buffer_rgb = ""
+    binary_data = []
+    buffer_a = []
+    buffer_rgb = []
     index_a = 0
     index_rgb = 0
     sig_confirmed = False
@@ -99,18 +99,23 @@ def read_info_from_image_stealth(image: Image.Image):
         for y in range(height):
             if has_alpha:
                 r, g, b, a = pixels[x, y]
-                buffer_a += str(a & 1)
+                buffer_a.append(str(a & 1))
                 index_a += 1
             else:
                 r, g, b = pixels[x, y]
-            buffer_rgb += str(r & 1)
-            buffer_rgb += str(g & 1)
-            buffer_rgb += str(b & 1)
+            buffer_rgb.append(str(r & 1))
+            buffer_rgb.append(str(g & 1))
+            buffer_rgb.append(str(b & 1))
             index_rgb += 3
+            
+            # Yield control every 1000 pixels to prevent blocking
+            if (x * height + y) % 1000 == 0:
+                await asyncio.sleep(0)
             if confirming_signature:
                 if index_a == len("stealth_pnginfo") * 8:
+                    buffer_a_str = ''.join(buffer_a)
                     decoded_sig = bytearray(
-                        int(buffer_a[i : i + 8], 2) for i in range(0, len(buffer_a), 8)
+                        int(buffer_a_str[i : i + 8], 2) for i in range(0, len(buffer_a_str), 8)
                     ).decode("utf-8", errors="ignore")
                     if decoded_sig in {"stealth_pnginfo", "stealth_pngcomp"}:
                         confirming_signature = False
@@ -125,8 +130,9 @@ def read_info_from_image_stealth(image: Image.Image):
                         read_end = True
                         break
                 elif index_rgb == len("stealth_pnginfo") * 8:
+                    buffer_rgb_str = ''.join(buffer_rgb)
                     decoded_sig = bytearray(
-                        int(buffer_rgb[i : i + 8], 2) for i in range(0, len(buffer_rgb), 8)
+                        int(buffer_rgb_str[i : i + 8], 2) for i in range(0, len(buffer_rgb_str), 8)
                     ).decode("utf-8", errors="ignore")
                     if decoded_sig in {"stealth_rgbinfo", "stealth_rgbcomp"}:
                         confirming_signature = False
@@ -173,8 +179,9 @@ def read_info_from_image_stealth(image: Image.Image):
                 break
         if read_end:
             break
-    if sig_confirmed and binary_data != "":
-        byte_data = bytearray(int(binary_data[i : i + 8], 2) for i in range(0, len(binary_data), 8))
+    if sig_confirmed and binary_data:
+        binary_data_str = ''.join(binary_data)
+        byte_data = bytearray(int(binary_data_str[i : i + 8], 2) for i in range(0, len(binary_data_str), 8))
         try:
             if compressed:
                 decoded_data = gzip.decompress(bytes(byte_data)).decode("utf-8")
@@ -218,7 +225,7 @@ async def read_attachment_metadata(i: int, attachment: Attachment, metadata: Ord
                 else:
                     info = comfyui_get_data(img.info)
             else:
-                info = read_info_from_image_stealth(img)
+                info = await read_info_from_image_stealth(img)
             if info:
                 metadata[i] = info
     except Exception as error:

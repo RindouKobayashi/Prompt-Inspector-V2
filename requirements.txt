@@ -7,3 +7,4 @@ google-generativeai
 pillow
 gradio_client
 psutil
+google-genai
