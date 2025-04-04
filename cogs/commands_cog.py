@@ -105,5 +105,48 @@ class CommandsCog(commands.Cog):
                 ephemeral=ephemeral
             )
 
+    @app_commands.user_install
+    @app_commands.describe(
+        question="The question to ask the bot",
+        ephemeral="Whether to show the answer privately (default: True)"
+    )
+    @app_commands.command(name="ask", description="Ask the bot a question (no context)")
+    async def ask(self, interaction: discord.Interaction, question: str, ephemeral: bool = True):
+        """Ask the bot a question"""
+        await interaction.response.defer(ephemeral=ephemeral)
+
+        try:
+            response = generate_content(question)
+            if len(response.text) > 2000:
+                # Split response into chunks if it's too long by word
+                chunks = split_by_words(response.text, max_length=2000)
+                for chunk in chunks:
+                    await interaction.followup.send(chunk, ephemeral=ephemeral)
+            else:
+                # Send the response directly if it's short enough
+                await interaction.followup.send(response.text, ephemeral=ephemeral)
+        except Exception as e:
+            logger.error(f"Ask command error: {e}")
+            await interaction.followup.send("Failed to get a response. Please try again later.", ephemeral=ephemeral)
+
+def split_by_words(text, max_length=2000):
+        """Split text into chunks without breaking words"""
+        words = text.split(' ')
+        chunks = []
+        current_chunk = ""
+        
+        for word in words:
+            if len(current_chunk) + len(word) + 1 <= max_length:
+                current_chunk += f" {word}"
+            else:
+                chunks.append(current_chunk.strip())
+                current_chunk = word
+                
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+            
+        return chunks
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(CommandsCog(bot))
