@@ -30,6 +30,7 @@ class CommandsCog(commands.Cog):
             logger.error(f"{type(e).__name__}: {e}")
             await interaction.response.send_message("Internal bot error, please contact the bot owner.", ephemeral=True)
 
+    @app_commands.user_install
     @app_commands.command(name="status")
     async def status(self, interaction: discord.Interaction):
         """Get the status of the VM/bot."""

@@ -7,15 +7,18 @@ from collections import OrderedDict
 import json
 import asyncio
 from io import StringIO
+from discord import app_commands
 
 logger.info("Image Metadata Context Menu Commands Loaded")
 
 def setup_contextmenu(bot: commands.Bot):
+    @app_commands.user_install
     @bot.tree.context_menu(name="View Raw Prompt")
     async def view_raw_prompt(interaction: discord.Interaction, message: discord.Message):
         """Show raw prompt metadata from image"""
         await handle_image_metadata(interaction, message, format="raw")
 
+    @app_commands.user_install
     @bot.tree.context_menu(name="View Parameters/Prompt") 
     async def view_formatted_prompt(interaction: discord.Interaction, message: discord.Message):
         """Show formatted prompt parameters from image"""
