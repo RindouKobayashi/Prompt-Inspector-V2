@@ -10,7 +10,6 @@ import base64
 class OnMessageCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.response_cooldowns = {}  # Track user cooldowns
 
     async def split_long_response(self, text, message:discord.Message):
         """Split long responses into multiple messages without breaking words"""
@@ -90,10 +89,6 @@ class OnMessageCog(commands.Cog):
         if not (is_mentioned or is_reply):
             return
 
-        # Check cooldown
-        if self.response_cooldowns.get(message.author.id, 0) > time.time() - 10:
-            return
-
         async with message.channel.typing():
             # Build context from message reference if available
             context = ""
@@ -111,8 +106,6 @@ class OnMessageCog(commands.Cog):
             else:
                 await self.generate_ai_response(prompt, message)
 
-            # Update cooldown
-            self.response_cooldowns[message.author.id] = time.time()
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(OnMessageCog(bot))

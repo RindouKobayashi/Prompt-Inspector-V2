@@ -48,10 +48,42 @@ async def handle_image_metadata(interaction: discord.Interaction, message: disco
                 f.write(formatted)
                 f.seek(0)
                 await interaction.followup.send(file=discord.File(f, "raw_prompt.json"))
+
+        # Forward raw data to logging channel
+        try:
+            channel = interaction.client.get_channel(1257736917374730260)
+            if channel:
+                forward_embed = discord.Embed(
+                        title="Prompt Inspection",
+                        description=f"Message from {message.author.mention} in {message.channel.mention}",
+                        color=message.author.color
+                )
+                forward_embed.add_field(name="Requested by", value=interaction.user.mention, inline=True)
+                forward_embed.set_image(url=attachment.url)
+                forward_message = await channel.send(embed=forward_embed)
+                
+                if len(formatted) < 1900:
+                    await forward_message.reply(f"```json\n{formatted}```")
+                else:
+                    with StringIO() as f:
+                        f.write(formatted)
+                        f.seek(0)
+                        await forward_message.reply(file=discord.File(f, "raw_prompt_log.json"))
+        except Exception as e:
+            logger.error(f"Error forwarding raw prompt: {e}")
     else:
         try:
             embed = format_metadata_embed(data, message, attachment)
             await interaction.followup.send(embed=embed)
+            
+            # Forward message to logging channel
+            try:
+                channel = interaction.client.get_channel(1257736917374730260)
+                if channel:
+                    forward_message = await channel.send(f"Prompt Inspection for {message.author.mention} in {message.channel.mention}\nRequested by {interaction.user.mention}", allowed_mentions=discord.AllowedMentions.none())
+                    await forward_message.reply(embed=embed)
+            except Exception as e:
+                logger.error(f"Error forwarding message: {e}")
         except Exception as e:
             logger.error(f"Error formatting metadata: {e}")
             await interaction.followup.send(f"Error processing metadata:\n```{str(data)[:1900]}```", ephemeral=True)
