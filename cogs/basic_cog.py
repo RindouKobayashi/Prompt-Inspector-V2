@@ -20,12 +20,6 @@ class BasicCog(commands.Cog):
         await interaction.response.send_message("Syncing commands with the server...", ephemeral=True)
         await self.bot.tree.sync()
         await interaction.edit_original_response(content="Commands have been synced with the server.")
-
-    @app_commands.command(name="generate_with_gemini", description="Generate an image with Gemini")
-    async def generate_with_gemini(self, interaction: discord.Interaction, prompt: str):
-        """Generate an image with Gemini"""
-        logger.info(f"Command /generate_with_gemini has been invoked by {interaction.user}")
-        
         
 
 async def setup(bot: commands.Bot):

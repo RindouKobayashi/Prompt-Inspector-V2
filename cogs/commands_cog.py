@@ -2,7 +2,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import settings
-from settings import logger, generate_content
+from settings import logger, generate_content, BytesIO
+from gemini.tools import generate_image
 
 class CommandsCog(commands.Cog):
     def __init__(self, bot):
@@ -129,23 +130,50 @@ class CommandsCog(commands.Cog):
             logger.error(f"Ask command error: {e}")
             await interaction.followup.send("Failed to get a response. Please try again later.", ephemeral=ephemeral)
 
-def split_by_words(text, max_length=2000):
-        """Split text into chunks without breaking words"""
-        words = text.split(' ')
-        chunks = []
-        current_chunk = ""
+    @app_commands.user_install
+    @app_commands.command(name="generate_with_gemini")
+    @app_commands.describe(
+        prompt="The prompt to generate an image with",
+        ephemeral="Whether to show the image privately (default: True)"
+    )
+    async def generate_with_gemini(
+        self,
+        interaction: discord.Interaction,
+        prompt: str,
+        ephemeral: bool = True
+    ):
+        """Generate an image using Gemini AI"""
+        await interaction.response.defer(ephemeral=ephemeral)
         
-        for word in words:
-            if len(current_chunk) + len(word) + 1 <= max_length:
-                current_chunk += f" {word}"
-            else:
-                chunks.append(current_chunk.strip())
-                current_chunk = word
-                
-        if current_chunk:
+        try:
+            image_bytes = await generate_image(prompt)
+            file = discord.File(BytesIO(image_bytes), filename="gemini-generated.png")
+            await interaction.followup.send(file=file, ephemeral=ephemeral)
+        except Exception as e:
+            logger.error(f"Image generation error: {e}")
+            await interaction.followup.send(
+                "Failed to generate image. Please try again later.",
+                ephemeral=ephemeral
+            )
+
+
+def split_by_words(text, max_length=2000):
+    """Split text into chunks without breaking words"""
+    words = text.split(' ')
+    chunks = []
+    current_chunk = ""
+    
+    for word in words:
+        if len(current_chunk) + len(word) + 1 <= max_length:
+            current_chunk += f" {word}"
+        else:
             chunks.append(current_chunk.strip())
+            current_chunk = word
             
-        return chunks
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+        
+    return chunks
 
 
 async def setup(bot: commands.Bot):

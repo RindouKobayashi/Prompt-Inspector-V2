@@ -5,3 +5,4 @@ __pycache__
 .vscode
 token.json
 client_secret.json
+gemini-generated-image.png
