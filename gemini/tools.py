@@ -4,6 +4,7 @@ from google.genai import types
 from PIL import Image
 from io import BytesIO
 import base64
+import asyncio # Added
 
 
 async def generate_image(prompt: str) -> bytes:
@@ -16,12 +17,15 @@ async def generate_image(prompt: str) -> bytes:
         bytes: The image bytes.
     """
     logger.info(f"tool.generate_image: Generating image with prompt: {prompt}")
-    response = client.models.generate_content(
+    
+    # Run the blocking API call in a separate thread
+    response = await asyncio.to_thread(
+        client.models.generate_content,
         model="gemini-2.0-flash-exp",
         contents=prompt,
         config=types.GenerateContentConfig(
-            response_modalities=['Text', 'Image']
-        )
+            response_modalities=['Text', 'Image'],
+        ),
     )
 
     image_bytes = None

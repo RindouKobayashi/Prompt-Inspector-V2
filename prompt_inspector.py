@@ -19,8 +19,15 @@ async def on_ready():
     # Loading cogs
     for cog_file in settings.COGS_DIR.glob("*cog.py"):
         if cog_file.name != "__init__.py":
-            await bot.load_extension(f"cogs.{cog_file.name[:-3]}")
-            logger.info(f"Loaded cog: {cog_file.name}")
+            ext_name = f"cogs.{cog_file.name[:-3]}"
+            if ext_name not in bot.extensions: # Check if extension is already loaded
+                try:
+                    await bot.load_extension(ext_name)
+                    logger.info(f"Loaded cog: {cog_file.name}")
+                except Exception as e:
+                    logger.error(f"Failed to load cog {cog_file.name}: {e}")
+            else:
+                logger.debug(f"Cog {cog_file.name} already loaded.") # Optional: Log if already loaded
 
     # Loading context menus
     image_metadata_context_menu.setup_contextmenu(bot)
