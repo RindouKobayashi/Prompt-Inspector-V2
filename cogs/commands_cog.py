@@ -35,6 +35,7 @@ class CommandsCog(commands.Cog):
     @app_commands.command(name="status")
     async def status(self, interaction: discord.Interaction):
         """Get the status of the VM/bot."""
+        await interaction.response.defer(ephemeral=True)
         if interaction.user.id != settings.BOT_OWNER_ID:
             await interaction.response.send_message("You are not allowed to run this command.", ephemeral=True)
             return
@@ -45,9 +46,9 @@ class CommandsCog(commands.Cog):
             embed.add_field(name="RAM Usage", value=f"{psutil.virtual_memory().percent}%")
             embed.add_field(name="Disk Usage", value=f"{psutil.disk_usage('/').percent}%")
             embed.set_footer(text="migus? plapped.", icon_url=interaction.user.display_avatar)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
         except ImportError:
-            await interaction.response.send_message("Status monitoring not available (psutil not installed)", ephemeral=True)
+            await interaction.followup.send("Status monitoring not available (psutil not installed)", ephemeral=True)
 
     @app_commands.command(name="summarize")
     @app_commands.describe(

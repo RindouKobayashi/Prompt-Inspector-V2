@@ -15,11 +15,13 @@ class BasicCog(commands.Cog):
     async def sync(self, interaction: discord.Interaction):
         """Sync the commands with the server"""
         logger.info(f"Command /sync has been invoked by {interaction.user}")
+        # Defer the response to allow for longer processing time
+        await interaction.response.defer()
         # Check if the user is the owner of the bot
         if interaction.user.id != settings.BOT_OWNER_ID:
-            await interaction.response.send_message("You are not allowed to run this command.", ephemeral=True)
+            await interaction.followup.send("You are not allowed to run this command.", ephemeral=True)
             return
-        await interaction.response.send_message("Syncing commands with the server...", ephemeral=True)
+        await interaction.followup.send("Syncing commands with the server...", ephemeral=True)
         await self.bot.tree.sync()
         await interaction.edit_original_response(content="Commands have been synced with the server.")
 
