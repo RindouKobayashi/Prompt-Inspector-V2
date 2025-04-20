@@ -18,10 +18,13 @@ class OnMessageCog(commands.Cog):
             await message.reply(chunk)
             time.sleep(0.5)  # Rate limiting
 
-    async def generate_ai_response(self, prompt, message: discord.Message):
-        """Core AI response generation"""
+    async def generate_ai_response(self, prompt_content, message: discord.Message):
+        """Core AI response generation. Handles both text and multimodal prompts."""
         try:
-            response = CHAT.send_message(prompt)
+            # Send the prompt content (string or list) to the AI
+            response = CHAT.send_message(prompt_content)
+            
+            # Process the response text
             if len(response.text) > 2000:
                 await self.split_long_response(response.text, message)
             else:
@@ -33,7 +36,10 @@ class OnMessageCog(commands.Cog):
             await message.reply("Sorry, I encountered an error processing your request.")
 
     async def process_attachments(self, message: discord.Message):
-        """Handle image attachments"""
+        """
+        Processes the first image attachment found in the message.
+        Returns a list [prompt_text, image_object] if an image is processed, otherwise None.
+        """
         try:
             for attachment in message.attachments:
                 if attachment.content_type.startswith('image/'):
@@ -41,17 +47,19 @@ class OnMessageCog(commands.Cog):
                     img = Image.open(BytesIO(image_data))
                     
                     # Create prompt combining message text and image
-                    prompt = f"""User ({message.author}) sent this image with message:
+                    prompt_text = f"""User ({message.author}) sent this image with message:
                     {message.content}
 
                     Please respond appropriately."""
                     
-                    # Send multimodal request
-                    response = CHAT.send_message([prompt, img])
-                    await self.generate_ai_response(response.text, message)
+                    # Return the prompt text and image object for the first image found
+                    return [prompt_text, img] 
+            # Return None if no image attachment was processed
+            return None
         except Exception as e:
             logger.error(f"Image processing error: {e}")
             await message.reply("I had trouble processing that image.")
+            return None # Ensure None is returned on error too
 
     def split_by_words(self, text, max_length=2000):
         """Split text into chunks without breaking words"""
@@ -99,12 +107,21 @@ class OnMessageCog(commands.Cog):
                 except:
                     pass
 
-            prompt = f"{message.author.mention}: {message.content}{context}"
+            # Prepare the base text prompt
+            base_prompt = f"{message.author.mention}: {message.content}{context}"
+            
+            # Default content to send is the base text prompt
+            content_to_send = base_prompt
 
+            # If there are attachments, try to process them
             if message.attachments:
-                await self.process_attachments(message)
-            else:
-                await self.generate_ai_response(prompt, message)
+                multimodal_content = await self.process_attachments(message)
+                # If an image was successfully processed, use that content
+                if multimodal_content:
+                    content_to_send = multimodal_content
+            
+            # Generate the response using the determined content (text or multimodal)
+            await self.generate_ai_response(content_to_send, message)
 
 
 async def setup(bot: commands.Bot):
