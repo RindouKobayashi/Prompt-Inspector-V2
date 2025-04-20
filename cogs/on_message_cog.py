@@ -1,15 +1,56 @@
 import discord
 import asyncio
 import time
+import re # Added for regex
+from urllib.parse import urlparse # Added for URL parsing
 from discord.ext import commands
 from settings import logger, CHAT
 from PIL import Image
 from io import BytesIO
 import base64
 
+# Helper function to extract domain from URL or text
+def get_domain(text):
+    try:
+        # Try parsing as a full URL first
+        parsed_url = urlparse(text)
+        if parsed_url.netloc:
+            domain = parsed_url.netloc
+        else:
+            # If not a full URL, try adding scheme and parsing again
+            # This helps catch domains like "google.com" in display text
+            parsed_url = urlparse(f"http://{text}")
+            if parsed_url.netloc:
+                domain = parsed_url.netloc
+            else: # If still no domain, return None
+                return None
+        # Remove 'www.' prefix if present and convert to lowercase
+        return domain.replace("www.", "").lower()
+    except Exception:
+        return None
+
 class OnMessageCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    async def notify_potential_scam(self, message: discord.Message, display_text: str, actual_url: str):
+        """Replies with an embed warning about potential masked link scams."""
+        embed = discord.Embed(
+            title="⚠️ Potential Scam Link Detected!",
+            description="This message contains a link where the displayed text might not match the actual destination. Please exercise caution.",
+            color=discord.Color.orange() # Or discord.Color.red()
+        )
+        # Use inline=False to ensure fields appear on separate lines
+        embed.add_field(name="Displayed Text", value=f"`{display_text}`", inline=False)
+        # Use code formatting for the URL to prevent Discord from trying to embed it
+        embed.add_field(name="Actual Destination", value=f"`{actual_url}`", inline=False)
+        embed.set_footer(text="Always verify links before clicking, especially if they seem suspicious.")
+
+        try:
+            await message.reply(embed=embed)
+            logger.warning(f"Potential scam link detected in message {message.id} from {message.author}. Display: '{display_text}', Actual: '{actual_url}'")
+        except discord.HTTPException as e:
+            logger.error(f"Failed to send scam warning embed for message {message.id}: {e}")
 
     async def split_long_response(self, text, message:discord.Message):
         """Split long responses into multiple messages without breaking words"""
@@ -81,9 +122,38 @@ class OnMessageCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        # Ignore bots
         if message.author.bot:
             return
-            
+
+        # --- Masked Link Scam Check ---
+        # Regex to find markdown links: [display text](actual_url) or [display text](<actual_url>)
+        # It captures the display text (group 1) and the actual URL (group 2)
+        # Handles optional angle brackets < > around the URL.
+        masked_link_pattern = r'\[([^\]]+)\]\(<?(https?://[^>\)]+)>?\)'
+        suspicious_link_details = None # Store details if found
+        for match in re.finditer(masked_link_pattern, message.content):
+            display_text = match.group(1)
+            actual_url = match.group(2)
+
+            display_domain = get_domain(display_text)
+            actual_domain = get_domain(actual_url)
+
+            # If we could extract both domains and they are different, flag it
+            if display_domain and actual_domain and display_domain != actual_domain:
+                # Check for common false positives like linking subdomains/paths
+                # e.g., [docs.example.com](https://example.com/docs) should be allowed
+                # Allow if display domain is a subdomain of actual domain or vice-versa
+                if not (display_domain.endswith(f".{actual_domain}") or actual_domain.endswith(f".{display_domain}")):
+                    suspicious_link_details = (display_text, actual_url)
+                    break # Stop checking after the first suspicious link
+
+        # If a suspicious link was found, notify and stop processing
+        if suspicious_link_details:
+            await self.notify_potential_scam(message, suspicious_link_details[0], suspicious_link_details[1])
+            return # Stop processing this message further
+
+        # --- Original AI Response Logic (Only if not a scam and mentioned/replied) ---
         # Check if bot is mentioned OR message is a reply to bot
         is_mentioned = self.bot.user in message.mentions
         is_reply = False
@@ -91,12 +161,19 @@ class OnMessageCog(commands.Cog):
             try:
                 ref_msg = await message.channel.fetch_message(message.reference.message_id)
                 is_reply = ref_msg.author == self.bot.user
-            except:
-                pass
-                
-        if not (is_mentioned or is_reply):
-            return
+            except discord.NotFound:
+                logger.warning(f"Reference message {message.reference.message_id} not found.")
+            except discord.HTTPException as e:
+                 logger.error(f"Failed to fetch reference message {message.reference.message_id}: {e}")
+            except Exception as e:
+                 logger.error(f"Unexpected error fetching reference message {message.reference.message_id}: {e}")
 
+
+        # Only proceed with AI response if mentioned or replied to
+        if not (is_mentioned or is_reply):
+            return # Don't process for AI if not mentioned/reply
+
+        # If it's a mention/reply and passed scam check, proceed with AI response
         async with message.channel.typing():
             # Build context from message reference if available
             context = ""
