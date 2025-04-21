@@ -32,9 +32,7 @@ async def on_ready():
     # Loading context menus
     image_metadata_context_menu.setup_contextmenu(bot)
 
-    # Change bot status
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="your messages"))
-
+    # Presence is now handled by PresenceCog
     
 async def shutdown_tasks():
     """
