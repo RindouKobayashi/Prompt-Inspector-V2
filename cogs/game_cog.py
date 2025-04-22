@@ -119,8 +119,8 @@ class GameState:
 class GameCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.answer_words, self.valid_guesses = self._load_word_list()
         self.current_word = self._get_random_word()
-        self.valid_words = self._load_word_list()
         self.games = {}  # Store game state per user: {user_id: GameState}
         self.stats = {}  # Store stats per user: {user_id: PlayerStats}
         self.stats_file = Path("data/wordle_stats.json")
@@ -133,7 +133,7 @@ class GameCog(commands.Cog):
         self.game_history = []  # List of past games
         self.load_stats()
         self.load_history()
-        logger.info(f"Initialized GameCog with word: {self.current_word}")
+        # logger.info(f"Initialized GameCog with word: {self.current_word}") # Removed logging
 
     def save_history(self):
         """Save game history to JSON file."""
@@ -195,20 +195,31 @@ class GameCog(commands.Cog):
             logger.error(f"Error loading Wordle stats: {e}")
             self.stats = {}  # Start fresh if loading fails
 
-    def _load_word_list(self) -> set:
-        """Load the list of valid 5-letter words."""
-        # Common 5-letter words - you can expand this list
-        return {
-            "apple", "beach", "chair", "dance", "eagle", "flame",
-            "ghost", "heart", "image", "juice", "knife", "lemon",
-            "mouse", "night", "ocean", "piano", "queen", "radio",
-            "snake", "table", "unity", "video", "water", "youth"
-        }
+    def _load_word_list(self) -> tuple[set, set]:
+        """Load the list of answer words and allowed guesses."""
+        try:
+            # Load answer words
+            with open("data/wordle-answers-alphabetical.txt", "r") as f:
+                answers = {line.strip() for line in f if line.strip()}
+            
+            # Load allowed guesses
+            with open("data/wordle-allowed-guesses.txt", "r") as f:
+                guesses = {line.strip() for line in f if line.strip()}
+            
+            # Combine them for valid guesses
+            valid_guesses = answers.union(guesses)
+            return answers, valid_guesses
+            
+        except Exception as e:
+            logger.error(f"Error loading word lists: {e}")
+            # Fallback to some default words if files can't be loaded
+            answers = {"apple", "beach", "chair", "dance", "eagle"}
+            return answers, answers.copy()
 
     def _get_random_word(self) -> str:
-        """Get a random word for the game."""
-        words = list(self._load_word_list())
-        return random.choice(words)
+        """Get a random word from the answer list."""
+        answers, _ = self._load_word_list()
+        return random.choice(list(answers))
 
     def _reset_game(self, user_id: int):
         """Reset game state for a user."""
@@ -222,7 +233,7 @@ class GameCog(commands.Cog):
             new_word = self._get_random_word()
             
         self.current_word = new_word
-        logger.info(f"New word chosen: {self.current_word}")
+        # logger.info(f"New word chosen: {self.current_word}") # Removed logging
         for player_id in self.games:
             self._reset_game(player_id)
 
@@ -353,9 +364,14 @@ class GameCog(commands.Cog):
                 f"Your patterns:\n{state.get_patterns_only()}\n\n"
                 f"Streak ended at: {stats.current_streak} wins"
             )
-        elif not word or len(word) != 5 or word.lower() not in self.valid_words:
-            await interaction.response.send_message("Please enter a valid 5-letter word!")
+        elif not word or len(word) != 5:
+            await interaction.response.send_message("Please enter a 5-letter word!")
         else:
+            _, valid_guesses = self._load_word_list()
+            if word.lower() not in valid_guesses:
+                await interaction.response.send_message("Please enter a valid 5-letter word!")
+                return
+            
             # Track guess in history
             if user_id not in self.current_game_history.all_guesses:
                 self.current_game_history.all_guesses[user_id] = []
@@ -601,7 +617,8 @@ class GameCog(commands.Cog):
                     ))
                     return choices
                 
-                if current not in self.valid_words:
+                _, valid_guesses = self._load_word_list()
+                if current not in valid_guesses:
                     choices.append(app_commands.Choice(
                         name=f"❌ Not a valid word ({state.attempts_remaining} attempts left)",
                         value=current
