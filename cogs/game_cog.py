@@ -272,7 +272,7 @@ class GameCog(commands.Cog):
         return "".join(result)
 
     @app_commands.command(name="wordle", description="Guess the 5-letter word in 6 tries. 🟩=correct, 🟨=wrong spot, ⬛=not in word")
-    @app_commands.describe(word="Type a 5-letter word to guess")
+    @app_commands.describe(word="Type a 5-letter word and use autocomplete to guess the word.")
     async def wordle(self, interaction: discord.Interaction, word: str):
         """Play Wordle using autocompletion."""
         user_id = interaction.user.id
