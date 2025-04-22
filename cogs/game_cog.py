@@ -333,7 +333,7 @@ class GameCog(commands.Cog):
             self.save_stats()
             
             await interaction.response.send_message(
-                f"🎉 Congratulations! You found the word `{word}` in {attempts_used} attempts!\n"
+                f"🎉 Congratulations! You found the word `{self.current_word}` in {attempts_used} attempts!\n"
                 f"A new word has been chosen for everyone!\n\n"
                 f"Your guesses:\n{state.get_full_history()}\n\n"
                 f"Current streak: {stats.current_streak} | Best streak: {stats.best_streak}"
