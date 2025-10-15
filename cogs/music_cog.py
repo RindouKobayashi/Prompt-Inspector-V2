@@ -20,6 +20,7 @@ class MusicCog(commands.Cog):
         self.CACHE_DURATION = 300  # 5 minutes
         self.music_queues = {}  # guild_id -> list of song_info dicts
         self.now_playing = {}   # guild_id -> current song_info dict
+        self.priority_queues = {}  # guild_id -> list of priority song_info dicts
         self.voice_check_task = None
         self.ALONE_TIMEOUT = 180  # 3 minutes in seconds
         self.EMPTY_CHANNEL_TIMEOUT = 30  # 30 seconds for empty channel
@@ -126,8 +127,10 @@ class MusicCog(commands.Cog):
                 break
 
         if song_info:
-            # Initialize queue for this guild if it doesn't exist
+            # Initialize queues for this guild if they don't exist
             guild_id = interaction.guild.id
+            if guild_id not in self.priority_queues:
+                self.priority_queues[guild_id] = []
             if guild_id not in self.music_queues:
                 self.music_queues[guild_id] = []
 
@@ -135,9 +138,12 @@ class MusicCog(commands.Cog):
             is_playing = interaction.guild.voice_client and interaction.guild.voice_client.is_playing()
 
             if is_playing:
-                # Add to queue
-                self.music_queues[guild_id].append(song_info)
-                queue_position = len(self.music_queues[guild_id])
+                # Add to priority queue (user-requested songs get priority)
+                self.priority_queues[guild_id].append(song_info)
+                # Calculate position in combined queue
+                total_priority = len(self.priority_queues[guild_id])
+                total_regular = len(self.music_queues[guild_id])
+                queue_position = total_priority + total_regular
 
                 # Create queue addition interface using LayoutView
                 view = LayoutView()
@@ -180,8 +186,15 @@ class MusicCog(commands.Cog):
                 else:
                     await interaction.followup.send(view=view)
             else:
-                # Play immediately
+                # Play immediately and ensure we have songs queued
                 self.now_playing[guild_id] = song_info
+
+                # Ensure we have at least 3 songs in the regular queue
+                current_regular_count = len(self.music_queues.get(guild_id, []))
+                if current_regular_count < 3:
+                    songs_to_add = 3 - current_regular_count
+                    await self.add_random_songs(guild_id, min_count=songs_to_add)
+
                 await self.play_song(interaction, song_info)
         else:
             await interaction.followup.send(f"Could not load song info for: {song_name}")
@@ -257,25 +270,86 @@ class MusicCog(commands.Cog):
         """Called when a song finishes playing"""
         guild_id = interaction.guild.id
 
-        # Check if there are songs in queue
+        # Check priority queue first (user-added songs)
+        if guild_id in self.priority_queues and self.priority_queues[guild_id]:
+            # Play next priority song
+            next_song = self.priority_queues[guild_id].pop(0)
+            self.now_playing[guild_id] = next_song
+            await self.play_song(interaction, next_song, send_message=False)
+            return
+
+        # Check if there are songs in regular queue
         if guild_id in self.music_queues and self.music_queues[guild_id]:
             # Play next song without sending followup message
             next_song = self.music_queues[guild_id].pop(0)
             self.now_playing[guild_id] = next_song
             await self.play_song(interaction, next_song, send_message=False)
         else:
-            # No more songs, clear now playing and disconnect from voice channel
-            if guild_id in self.now_playing:
-                del self.now_playing[guild_id]
+            # No more songs in regular queue, add random songs
+            await self.add_random_songs(guild_id)
 
-            # Disconnect from voice channel after a short delay
-            if interaction.guild.voice_client:
-                await asyncio.sleep(1)  # Brief pause before disconnecting
-                await interaction.guild.voice_client.disconnect()
-                #logger.info(f"Disconnected from voice channel in guild {guild_id} - no more songs in queue")
+            # Try to play from the newly added random songs
+            if guild_id in self.music_queues and self.music_queues[guild_id]:
+                next_song = self.music_queues[guild_id].pop(0)
+                self.now_playing[guild_id] = next_song
+                await self.play_song(interaction, next_song, send_message=False)
+            else:
+                # No more songs, clear now playing and disconnect from voice channel
+                if guild_id in self.now_playing:
+                    del self.now_playing[guild_id]
 
-            # Clear Rich Presence when no music is playing
-            await self.bot.change_presence(activity=None)
+                # Disconnect from voice channel after a short delay
+                if interaction.guild.voice_client:
+                    await asyncio.sleep(1)  # Brief pause before disconnecting
+                    await interaction.guild.voice_client.disconnect()
+                    #logger.info(f"Disconnected from voice channel in guild {guild_id} - no more songs in queue")
+
+                # Clear Rich Presence when no music is playing
+                await self.bot.change_presence(activity=None)
+
+    async def add_random_songs(self, guild_id: int, min_count: int = 3):
+        """Add up to 3 random songs to the queue"""
+        if not self.song_cache:
+            return
+
+        import random
+
+        # Get songs not currently in queue or playing
+        available_songs = []
+        current_queue = self.music_queues.get(guild_id, [])
+        priority_queue = self.priority_queues.get(guild_id, [])
+        current_playing = self.now_playing.get(guild_id)
+
+        # Create set of songs already in queues
+        queued_song_paths = set()
+        for song in current_queue + priority_queue:
+            queued_song_paths.add(song['file_path'])
+        if current_playing:
+            queued_song_paths.add(current_playing['file_path'])
+
+        # Filter available songs
+        for song in self.song_cache:
+            if song['file_path'] not in queued_song_paths:
+                available_songs.append(song)
+
+        if not available_songs:
+            return
+
+        # Select up to the minimum count (default 3) or available songs
+        num_to_add = min(min_count, len(available_songs))
+        random_songs = random.sample(available_songs, num_to_add)
+
+        # Mark these songs as random for display purposes
+        for song in random_songs:
+            song['is_random'] = True
+
+        # Initialize queue if needed
+        if guild_id not in self.music_queues:
+            self.music_queues[guild_id] = []
+
+        # Add random songs to queue
+        self.music_queues[guild_id].extend(random_songs)
+        logger.info(f"Added {len(random_songs)} random songs to queue for guild {guild_id}")
 
 
     def load_song_cache(self):
@@ -434,14 +508,45 @@ class MusicCog(commands.Cog):
             view.add_item(full_container)
 
         full_container.add_item(Separator())
-        full_container.add_item(TextDisplay(f"## 📋 Queue • {len(self.music_queues[guild_id])} songs"))
-        if guild_id in self.music_queues and self.music_queues[guild_id]:
-            for i, song in enumerate(self.music_queues[guild_id][:10], 1):  # Show first 10
-                full_container.add_item(TextDisplay(f"{i}. {song['title']} - {song['artist']}\n"))
 
-            if len(self.music_queues[guild_id]) > 10:
-                full_container.add_item(TextDisplay(f"... and {len(self.music_queues[guild_id]) - 10} more songs"))
+        # Show priority queue (user-requested songs) first
+        priority_count = len(self.priority_queues.get(guild_id, []))
+        regular_count = len(self.music_queues.get(guild_id, []))
+        total_count = priority_count + regular_count
 
+        full_container.add_item(TextDisplay(f"## 📋 Queue • {total_count} songs"))
+
+        if total_count > 0:
+            # Show priority queue items first
+            if priority_count > 0:
+                full_container.add_item(TextDisplay("### ⭐ Priority Queue:"))
+                for i, song in enumerate(self.priority_queues[guild_id][:5], 1):  # Show first 5 priority
+                    full_container.add_item(TextDisplay(f"⭐ {i}. {song['title']} - {song['artist']}\n"))
+
+                if priority_count > 5:
+                    full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - 5} more priority songs"))
+
+            # Show regular queue items
+            if regular_count > 0:
+                if priority_count > 0:
+                    full_container.add_item(TextDisplay("### 🎲 Regular Queue:"))
+
+                # Calculate starting index for regular queue display
+                start_index = 1
+                if priority_count > 0:
+                    start_index = priority_count + 1
+
+                # Show up to 5 more regular queue items (total display limit consideration)
+                display_limit = 10 - min(priority_count, 5)  # Leave room for priority items
+                regular_display = self.music_queues[guild_id][:display_limit]
+
+                for i, song in enumerate(regular_display, start_index):
+                    queue_type = "🎲" if song.get('is_random', False) else "➡️"
+                    full_container.add_item(TextDisplay(f"{queue_type} {i}. {song['title']} - {song['artist']}\n"))
+
+                remaining_regular = regular_count - len(regular_display)
+                if remaining_regular > 0:
+                    full_container.add_item(TextDisplay(f"➡️ ... and {remaining_regular} more songs"))
         else:
             full_container.add_item(TextDisplay("No songs in queue"))
 
