@@ -23,6 +23,7 @@ elif branch == "dev":
 
 BASE_DIR = pathlib.Path(__file__).parent
 COGS_DIR = BASE_DIR / "cogs"
+SONGS_DIR = BASE_DIR / "songs"
 
 
 GEMINI_DIR = BASE_DIR / "gemini"
