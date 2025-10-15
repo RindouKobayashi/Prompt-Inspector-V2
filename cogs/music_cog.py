@@ -8,6 +8,9 @@ from settings import logger
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3
 from io import BytesIO
+import json
+import os
+from pathlib import Path
 
 class MusicCog(commands.Cog):
     def __init__(self, bot):
@@ -17,6 +20,65 @@ class MusicCog(commands.Cog):
         self.CACHE_DURATION = 300  # 5 minutes
         self.music_queues = {}  # guild_id -> list of song_info dicts
         self.now_playing = {}   # guild_id -> current song_info dict
+        self.voice_check_task = None
+        self.ALONE_TIMEOUT = 180  # 3 minutes in seconds
+        self.EMPTY_CHANNEL_TIMEOUT = 30  # 30 seconds for empty channel
+        self.CACHE_FILE = settings.SONGS_DIR / "song_cache.json"
+
+        # Create initial cache on startup
+        asyncio.create_task(self.initialize_cache())
+
+    async def initialize_cache(self):
+        """Initialize song cache on startup"""
+        try:
+            # Try to load existing cache first
+            if not self.load_song_cache():
+                # If no valid cache exists, build one
+                import time
+                current_time = time.time()
+                self.song_cache = []
+                self.cache_timestamp = current_time
+
+                def get_song_metadata():
+                    songs_with_metadata = []
+                    for mp3_file in settings.SONGS_DIR.glob("**/*.mp3"):
+                        try:
+                            audio = MP3(mp3_file, ID3=ID3)
+                            title = audio.get('TIT2', mp3_file.stem).text[0] if audio.get('TIT2') else mp3_file.stem
+                            artist = audio.get('TPE1', 'Unknown Artist').text[0] if audio.get('TPE1') else 'Unknown Artist'
+
+                            # Create display name with artist
+                            display_name = f"{title} - {artist}"
+                            songs_with_metadata.append({
+                                'file_path': str(mp3_file),  # Convert Path to string for JSON
+                                'title': title,
+                                'artist': artist,
+                                'display_name': display_name,
+                                'duration': int(audio.info.length) if audio.info else 0
+                            })
+                        except Exception as e:
+                            logger.warning(f"Could not read metadata for {mp3_file}: {e}")
+                            # Fallback to filename
+                            songs_with_metadata.append({
+                                'file_path': str(mp3_file),
+                                'title': mp3_file.stem,
+                                'artist': 'Unknown Artist',
+                                'display_name': f"{mp3_file.stem} - Unknown Artist",
+                                'duration': 0
+                            })
+
+                    return songs_with_metadata
+
+                self.song_cache = await asyncio.to_thread(get_song_metadata)
+                self.cache_timestamp = current_time
+                logger.info(f"Built initial song cache: {len(self.song_cache)} songs")
+
+                # Save the initial cache
+                self.save_song_cache()
+
+        except Exception as e:
+            logger.error(f"Failed to initialize song cache: {e}")
+            self.song_cache = []
 
     @app_commands.command(name="play", description="Play a song from local library")
     # Song name using autocomplete
@@ -26,7 +88,16 @@ class MusicCog(commands.Cog):
         if interaction.user.voice is None:
             await interaction.response.send_message("You are not connected to a voice channel.", delete_after=10)
             return
-        
+
+        # Check bot permissions for voice channel
+        bot_member = interaction.guild.get_member(self.bot.user.id)
+        if not interaction.user.voice.channel.permissions_for(bot_member).connect:
+            await interaction.response.send_message("I don't have permission to connect to your voice channel.", delete_after=10)
+            return
+        if not interaction.user.voice.channel.permissions_for(bot_member).speak:
+            await interaction.response.send_message("I don't have permission to speak in your voice channel.", delete_after=10)
+            return
+
         # Verify the song exists in cache
         song_exists = any(song['display_name'] == song_name for song in self.song_cache) if self.song_cache else False
         if not song_exists:
@@ -137,6 +208,21 @@ class MusicCog(commands.Cog):
         except Exception as e:
             logger.warning(f"Could not extract album art: {e}")
 
+        # Update Discord Rich Presence (only for this server)
+        try:
+            activity = discord.Activity(
+                type=discord.ActivityType.listening,
+                name=song_info['title'],
+                details=f"by {song_info['artist']}",
+                state=f"Duration: {song_info['duration_str']}"
+            )
+            await self.bot.change_presence(activity=activity)
+        except discord.Forbidden:
+            # No permission to change presence, skip silently
+            pass
+
+        # Voice channel monitoring is now handled by event listeners
+
         # Create music player interface using LayoutView
         view = LayoutView()
 
@@ -188,6 +274,51 @@ class MusicCog(commands.Cog):
                 await interaction.guild.voice_client.disconnect()
                 #logger.info(f"Disconnected from voice channel in guild {guild_id} - no more songs in queue")
 
+            # Clear Rich Presence when no music is playing
+            await self.bot.change_presence(activity=None)
+
+
+    def load_song_cache(self):
+        """Load song cache from file if it exists and is valid"""
+        if self.CACHE_FILE.exists():
+            try:
+                with open(self.CACHE_FILE, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+
+                # Check if cache is still valid (files haven't changed)
+                cached_files = set(cache_data.get('files', []))
+                current_files = set(str(f) for f in settings.SONGS_DIR.glob("**/*.mp3"))
+
+                if cached_files == current_files:
+                    self.song_cache = cache_data['songs']
+                    self.cache_timestamp = cache_data.get('timestamp', 0)
+                    logger.info(f"Loaded song cache from file: {len(self.song_cache)} songs")
+                    return True
+                else:
+                    logger.info("Song files have changed, rebuilding cache")
+            except Exception as e:
+                logger.warning(f"Failed to load song cache: {e}")
+
+        return False
+
+    def save_song_cache(self):
+        """Save current song cache to file"""
+        try:
+            cache_data = {
+                'songs': self.song_cache,
+                'timestamp': self.cache_timestamp,
+                'files': [str(f) for f in settings.SONGS_DIR.glob("**/*.mp3")]
+            }
+
+            # Ensure directory exists
+            self.CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(self.CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"Saved song cache to file: {len(self.song_cache)} songs")
+        except Exception as e:
+            logger.error(f"Failed to save song cache: {e}")
 
     # Song name autocomplete function
     @play.autocomplete("song_name")
@@ -196,7 +327,14 @@ class MusicCog(commands.Cog):
 
         # Check if we need to refresh cache
         current_time = time.time()
-        if self.song_cache is None or (current_time - self.cache_timestamp) > self.CACHE_DURATION:
+        if self.song_cache is None:
+            # Try to load from file first
+            if not self.load_song_cache():
+                # File doesn't exist or is invalid, build cache
+                self.song_cache = []
+                self.cache_timestamp = current_time
+
+        if (current_time - self.cache_timestamp) > self.CACHE_DURATION:
             def get_song_metadata():
                 songs_with_metadata = []
                 for mp3_file in settings.SONGS_DIR.glob("**/*.mp3"):
@@ -208,7 +346,7 @@ class MusicCog(commands.Cog):
                         # Create display name with artist
                         display_name = f"{title} - {artist}"
                         songs_with_metadata.append({
-                            'file_path': mp3_file,
+                            'file_path': str(mp3_file),  # Convert Path to string for JSON
                             'title': title,
                             'artist': artist,
                             'display_name': display_name,
@@ -218,10 +356,11 @@ class MusicCog(commands.Cog):
                         logger.warning(f"Could not read metadata for {mp3_file}: {e}")
                         # Fallback to filename
                         songs_with_metadata.append({
-                            'file_path': mp3_file,
+                            'file_path': str(mp3_file),
                             'title': mp3_file.stem,
                             'artist': 'Unknown Artist',
-                            'display_name': f"{mp3_file.stem} - Unknown Artist"
+                            'display_name': f"{mp3_file.stem} - Unknown Artist",
+                            'duration': 0
                         })
 
                 return songs_with_metadata
@@ -229,6 +368,9 @@ class MusicCog(commands.Cog):
             self.song_cache = await asyncio.to_thread(get_song_metadata)
             self.cache_timestamp = current_time
             logger.info(f"Cached {len(self.song_cache)} songs")
+
+            # Save cache to file
+            self.save_song_cache()
 
         def search_current_term(query):
             songs_data = self.song_cache
@@ -308,6 +450,137 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(view=view, file=album_art_file)
         else:
             await interaction.followup.send(view=view)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        """Handle voice channel state changes for music management"""
+        # Ignore bot state changes
+        if member.bot:
+            return
+
+        guild = member.guild
+        voice_client = guild.voice_client
+
+        # Only care if bot is connected to voice
+        if not voice_client or not voice_client.is_connected():
+            return
+
+        channel = voice_client.channel
+
+        # Check if someone joined/left our channel
+        if before.channel == channel or after.channel == channel:
+            # Count non-bot members in the channel
+            human_members = [m for m in channel.members if not m.bot]
+
+            if len(human_members) == 0:
+                # Channel is now empty, pause music if playing
+                if voice_client.is_playing():
+                    voice_client.pause()
+                    logger.info(f"Paused music in {guild.name} - channel is empty")
+
+                # Start alone timer if not already started
+                if not hasattr(voice_client, 'alone_since'):
+                    voice_client.alone_since = asyncio.get_event_loop().time()
+                    # Schedule disconnect check
+                    asyncio.create_task(self.schedule_disconnect(guild, voice_client))
+
+                # Update presence to show disconnect countdown immediately
+                try:
+                    await self.update_alone_presence(guild)
+                except discord.Forbidden:
+                    # No permission to change presence, skip silently
+                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to update alone presence: {e}")
+
+            elif len(human_members) > 0:
+                # People are back - always resume and restore normal presence
+                was_alone = hasattr(voice_client, 'alone_since')
+
+                if voice_client.is_paused():
+                    voice_client.resume()
+                    logger.info(f"Resumed music in {guild.name} - people returned")
+
+                # Reset alone timer
+                if hasattr(voice_client, 'alone_since'):
+                    delattr(voice_client, 'alone_since')
+
+                # Always restore normal music presence when people return
+                try:
+                    if guild.id in self.now_playing:
+                        song_info = self.now_playing[guild.id]
+                        activity = discord.Activity(
+                            type=discord.ActivityType.listening,
+                            name=song_info['title'],
+                            details=f"by {song_info['artist']}",
+                            state=f"Duration: {song_info.get('duration_str', 'Unknown')}"
+                        )
+                        await self.bot.change_presence(activity=activity)
+                    elif was_alone:
+                        # If we were alone but no music is playing, clear presence
+                        await self.bot.change_presence(activity=None)
+                except discord.Forbidden:
+                    # No permission to change presence, skip silently
+                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to update presence on return: {e}")
+
+    async def update_alone_presence(self, guild: discord.Guild):
+        """Update Rich Presence to show disconnect countdown when alone"""
+        try:
+            voice_client = guild.voice_client
+            if not voice_client or not hasattr(voice_client, 'alone_since'):
+                return
+
+            alone_time = asyncio.get_event_loop().time() - voice_client.alone_since
+            remaining_time = max(0, self.ALONE_TIMEOUT - alone_time)
+
+            if remaining_time > 0:
+                minutes = int(remaining_time // 60)
+                seconds = int(remaining_time % 60)
+
+                activity = discord.Activity(
+                    type=discord.ActivityType.listening,
+                    name="⏸️ Paused - Alone in VC",
+                    details=f"Disconnecting in {minutes}:{seconds:02d}",
+                    state=f"🎵 {guild.name}"
+                )
+                await self.bot.change_presence(activity=activity)
+
+        except Exception as e:
+            logger.error(f"Error updating alone presence: {e}")
+
+    async def schedule_disconnect(self, guild: discord.Guild, voice_client):
+        """Schedule automatic disconnect after alone timeout"""
+        try:
+            # Update presence periodically while alone
+            update_interval = 5  # Update every 5 seconds
+            updates_remaining = self.ALONE_TIMEOUT // update_interval
+
+            for _ in range(updates_remaining):
+                if not hasattr(voice_client, 'alone_since'):
+                    # Timer was cancelled
+                    return
+                await self.update_alone_presence(guild)
+                await asyncio.sleep(update_interval)
+
+            # Final check - full timeout reached
+            if (hasattr(voice_client, 'alone_since') and
+                voice_client.is_connected() and
+                len([m for m in voice_client.channel.members if not m.bot]) == 0):
+
+                await voice_client.disconnect()
+                logger.info(f"Disconnected from {guild.name} - alone for {self.ALONE_TIMEOUT} seconds")
+
+                # Clear Rich Presence
+                await self.bot.change_presence(activity=None)
+
+                # Clear now playing for this guild
+                if guild.id in self.now_playing:
+                    del self.now_playing[guild.id]
+
+        except Exception as e:
+            logger.error(f"Error in scheduled disconnect: {e}")
 
     @app_commands.command(name="skip", description="Skip the current song")
     async def skip(self, interaction: discord.Interaction):

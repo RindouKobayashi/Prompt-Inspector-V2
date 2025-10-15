@@ -41,11 +41,37 @@ class PresenceCog(commands.Cog):
     async def change_status(self):
         """Cycles through dynamic statuses without repeating."""
         try:
+            # Check if music is currently playing OR if bot is alone in VC (don't override music Rich Presence)
+            should_skip_presence = False
+
+            for cog in self.bot.cogs.values():
+                if hasattr(cog, 'now_playing'):
+                    # Check if any guild has music playing
+                    if any(cog.now_playing.values()):
+                        should_skip_presence = True
+                        break
+
+                    # Also check if bot is alone in any voice channel (showing disconnect countdown)
+                    for guild in self.bot.guilds:
+                        voice_client = guild.voice_client
+                        if (voice_client and voice_client.is_connected() and
+                            hasattr(voice_client, 'alone_since') and
+                            len([m for m in voice_client.channel.members if not m.bot]) == 0):
+                            should_skip_presence = True
+                            break
+
+                    if should_skip_presence:
+                        break
+
+            if should_skip_presence:
+                logger.debug("Music playing or bot alone in VC, skipping presence change")
+                return
+
             self.guild_count = len(self.bot.guilds)
             available_statuses = self.get_statuses()
             if not available_statuses:
                 return
-            
+
             self.current_status = random.choice(available_statuses)
             activity_type, status_text = self.current_status
             activity = discord.Activity(type=activity_type, name=status_text)
