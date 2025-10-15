@@ -140,10 +140,8 @@ class MusicCog(commands.Cog):
             if is_playing:
                 # Add to priority queue (user-requested songs get priority)
                 self.priority_queues[guild_id].append(song_info)
-                # Calculate position in combined queue
-                total_priority = len(self.priority_queues[guild_id])
-                total_regular = len(self.music_queues[guild_id])
-                queue_position = total_priority + total_regular
+                # Calculate position in combined queue (priority songs play first)
+                queue_position = len(self.priority_queues[guild_id])
 
                 # Create queue addition interface using LayoutView
                 view = LayoutView()
@@ -270,6 +268,15 @@ class MusicCog(commands.Cog):
         """Called when a song finishes playing"""
         guild_id = interaction.guild.id
 
+        # Check if bot is still connected to voice - if not, don't try to play next song
+        if not interaction.guild.voice_client or not interaction.guild.voice_client.is_connected():
+            # Clear now playing for this guild since we're disconnected
+            if guild_id in self.now_playing:
+                del self.now_playing[guild_id]
+            # Clear Rich Presence when no music is playing
+            await self.bot.change_presence(activity=None)
+            return
+
         # Check priority queue first (user-added songs)
         if guild_id in self.priority_queues and self.priority_queues[guild_id]:
             # Play next priority song
@@ -283,6 +290,14 @@ class MusicCog(commands.Cog):
             # Play next song without sending followup message
             next_song = self.music_queues[guild_id].pop(0)
             self.now_playing[guild_id] = next_song
+
+            # Check if we need to maintain 3-song minimum after consuming from regular queue
+            current_regular_count = len(self.music_queues.get(guild_id, []))
+            if current_regular_count < 3:
+                songs_to_add = 3 - current_regular_count
+                # Add random songs in background without awaiting
+                asyncio.create_task(self.add_random_songs(guild_id, min_count=songs_to_add))
+
             await self.play_song(interaction, next_song, send_message=False)
         else:
             # No more songs in regular queue, add random songs
@@ -349,7 +364,6 @@ class MusicCog(commands.Cog):
 
         # Add random songs to queue
         self.music_queues[guild_id].extend(random_songs)
-        logger.info(f"Added {len(random_songs)} random songs to queue for guild {guild_id}")
 
 
     def load_song_cache(self):
@@ -397,54 +411,15 @@ class MusicCog(commands.Cog):
     # Song name autocomplete function
     @play.autocomplete("song_name")
     async def song_name_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        import time
-
-        # Check if we need to refresh cache
-        current_time = time.time()
+        # Only load from file, don't regenerate cache
         if self.song_cache is None:
-            # Try to load from file first
+            # Try to load from file
             if not self.load_song_cache():
-                # File doesn't exist or is invalid, build cache
-                self.song_cache = []
-                self.cache_timestamp = current_time
+                # If no cache file exists, return empty
+                return []
 
-        if (current_time - self.cache_timestamp) > self.CACHE_DURATION:
-            def get_song_metadata():
-                songs_with_metadata = []
-                for mp3_file in settings.SONGS_DIR.glob("**/*.mp3"):
-                    try:
-                        audio = MP3(mp3_file, ID3=ID3)
-                        title = audio.get('TIT2', mp3_file.stem).text[0] if audio.get('TIT2') else mp3_file.stem
-                        artist = audio.get('TPE1', 'Unknown Artist').text[0] if audio.get('TPE1') else 'Unknown Artist'
-
-                        # Create display name with artist
-                        display_name = f"{title} - {artist}"
-                        songs_with_metadata.append({
-                            'file_path': str(mp3_file),  # Convert Path to string for JSON
-                            'title': title,
-                            'artist': artist,
-                            'display_name': display_name,
-                            'duration': int(audio.info.length) if audio.info else 0
-                        })
-                    except Exception as e:
-                        logger.warning(f"Could not read metadata for {mp3_file}: {e}")
-                        # Fallback to filename
-                        songs_with_metadata.append({
-                            'file_path': str(mp3_file),
-                            'title': mp3_file.stem,
-                            'artist': 'Unknown Artist',
-                            'display_name': f"{mp3_file.stem} - Unknown Artist",
-                            'duration': 0
-                        })
-
-                return songs_with_metadata
-
-            self.song_cache = await asyncio.to_thread(get_song_metadata)
-            self.cache_timestamp = current_time
-            logger.info(f"Cached {len(self.song_cache)} songs")
-
-            # Save cache to file
-            self.save_song_cache()
+        if not self.song_cache:
+            return []
 
         def search_current_term(query):
             songs_data = self.song_cache
@@ -514,47 +489,454 @@ class MusicCog(commands.Cog):
         regular_count = len(self.music_queues.get(guild_id, []))
         total_count = priority_count + regular_count
 
-        full_container.add_item(TextDisplay(f"## 📋 Queue • {total_count} songs"))
+
 
         if total_count > 0:
-            # Show priority queue items first
-            if priority_count > 0:
-                full_container.add_item(TextDisplay("### ⭐ Priority Queue:"))
-                for i, song in enumerate(self.priority_queues[guild_id][:5], 1):  # Show first 5 priority
-                    full_container.add_item(TextDisplay(f"⭐ {i}. {song['title']} - {song['artist']}\n"))
+            # If priority queue is large, show only priority queue to avoid UI limits
+            if priority_count > 3:
+                # Show only priority queue when it's large
+                full_container.add_item(TextDisplay(f"### ⭐ Priority Queue: ({priority_count})"))
+                priority_to_show = min(6, priority_count)  # Show up to 6 priority items
 
-                if priority_count > 5:
-                    full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - 5} more priority songs"))
+                for i, song in enumerate(self.priority_queues[guild_id][:priority_to_show], 1):
+                    # Format duration for display
+                    if 'duration' in song and song['duration']:
+                        minutes = song['duration'] // 60
+                        seconds = song['duration'] % 60
+                        duration_str = f"{minutes}:{seconds:02d}"
+                    else:
+                        duration_str = "Unknown"
+                    full_container.add_item(Section(
+                        TextDisplay(f"{i}. **{song['title']}**"),
+                        TextDisplay(f"-# {song['artist']} ({duration_str})"),
+                        accessory=discord.ui.Button(
+                            style=discord.ButtonStyle.secondary,
+                            label="Remove",
+                            custom_id=f"remove_priority_{guild_id}_{i-1}",
+                        )
+                    ))
 
-            # Show regular queue items
-            if regular_count > 0:
-                if priority_count > 0:
-                    full_container.add_item(TextDisplay("### 🎲 Regular Queue:"))
+                if priority_count > priority_to_show:
+                    full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - priority_to_show} more priority songs"))
 
-                # Calculate starting index for regular queue display
-                start_index = 1
-                if priority_count > 0:
-                    start_index = priority_count + 1
+                # Don't show regular queue when priority is large
+                if regular_count > 0:
+                    full_container.add_item(TextDisplay(f"🎲 {regular_count} regular songs queued after priority"))
+            else:
+                # Show both queues when priority is small
+                # Limit display to avoid hitting 40 child limit
+                max_sections = 8  # Stay well under 40 total children
+                sections_used = 0
 
-                # Show up to 5 more regular queue items (total display limit consideration)
-                display_limit = 10 - min(priority_count, 5)  # Leave room for priority items
-                regular_display = self.music_queues[guild_id][:display_limit]
+                # Show priority queue items first (prioritize these)
+                if priority_count > 0 and sections_used < max_sections:
+                    full_container.add_item(TextDisplay(f"### ⭐ Priority Queue: ({priority_count})"))
+                    priority_to_show = min(3, priority_count, max_sections - sections_used)
 
-                for i, song in enumerate(regular_display, start_index):
-                    queue_type = "🎲" if song.get('is_random', False) else "➡️"
-                    full_container.add_item(TextDisplay(f"{queue_type} {i}. {song['title']} - {song['artist']}\n"))
+                    for i, song in enumerate(self.priority_queues[guild_id][:priority_to_show], 1):
+                        # Format duration for display
+                        if 'duration' in song and song['duration']:
+                            minutes = song['duration'] // 60
+                            seconds = song['duration'] % 60
+                            duration_str = f"{minutes}:{seconds:02d}"
+                        else:
+                            duration_str = "Unknown"
+                        full_container.add_item(Section(
+                            TextDisplay(f"{i}. **{song['title']}**"),
+                            TextDisplay(f"-# {song['artist']} ({duration_str})"),
+                            accessory=discord.ui.Button(
+                                style=discord.ButtonStyle.secondary,
+                                label="Remove",
+                                custom_id=f"remove_priority_{guild_id}_{i-1}",
+                            )
+                        ))
+                        sections_used += 1
 
-                remaining_regular = regular_count - len(regular_display)
-                if remaining_regular > 0:
-                    full_container.add_item(TextDisplay(f"➡️ ... and {remaining_regular} more songs"))
+                    if priority_count > priority_to_show:
+                        full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - priority_to_show} more priority songs"))
+
+                # Show regular queue items only if we have space
+                if regular_count > 0 and sections_used < max_sections:
+                    remaining_slots = max_sections - sections_used
+                    if priority_count > 0:
+                        full_container.add_item(Separator(visible=False))
+                    full_container.add_item(TextDisplay(f"### 🎲 Regular Queue: ({regular_count})"))
+
+                    # Calculate starting index for regular queue display
+                    start_index = 1
+                    if priority_count > 0:
+                        start_index = priority_count + 1
+
+                    # Show remaining available slots for regular queue
+                    regular_to_show = min(remaining_slots, regular_count)
+                    regular_display = self.music_queues[guild_id][:regular_to_show]
+
+                    for i, song in enumerate(regular_display, start_index):
+                        # Format duration for display
+                        if 'duration' in song and song['duration']:
+                            minutes = song['duration'] // 60
+                            seconds = song['duration'] % 60
+                            duration_str = f"{minutes}:{seconds:02d}"
+                        else:
+                            duration_str = "Unknown"
+                        full_container.add_item(Section(
+                            TextDisplay(f"{i}. **{song['title']}**"),
+                            TextDisplay(f"-# {song['artist']} ({duration_str})"),
+                            accessory=discord.ui.Button(
+                                style=discord.ButtonStyle.secondary,
+                                label="Remove",
+                                custom_id=f"remove_regular_{guild_id}_{i-start_index}",
+                            )
+                        ))
+
+                    remaining_regular = regular_count - len(regular_display)
+                    if remaining_regular > 0:
+                        full_container.add_item(TextDisplay(f"➡️ ... and {remaining_regular} more songs"))
         else:
             full_container.add_item(TextDisplay("No songs in queue"))
+
+        # Add control buttons container
+        control_container = Container(
+            ActionRow(
+                discord.ui.Button(
+                    style=discord.ButtonStyle.primary,
+                    label="⏭️ Skip",
+                    custom_id=f"queue_skip_{guild_id}",
+                ),
+                discord.ui.Button(
+                    style=discord.ButtonStyle.danger,
+                    label="⏹️ Stop",
+                    custom_id=f"queue_stop_{guild_id}",
+                ),
+                discord.ui.Button(
+                    style=discord.ButtonStyle.secondary,
+                    label="🔀 Shuffle",
+                    custom_id=f"queue_shuffle_{guild_id}",
+                ),
+            ),
+        )
+        view.add_item(control_container)
 
         # Send the view with album art file if it exists
         if 'album_art_file' in locals() and album_art_file is not None:
             await interaction.followup.send(view=view, file=album_art_file)
         else:
             await interaction.followup.send(view=view)
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        """Handle button interactions for queue management"""
+        if interaction.type == discord.InteractionType.component:
+            custom_id = interaction.data.get('custom_id', '')
+            if custom_id.startswith('remove_'):
+                await self.handle_remove_button(interaction, custom_id)
+            elif custom_id.startswith('queue_'):
+                await self.handle_queue_button(interaction, custom_id)
+
+    async def handle_remove_button(self, interaction: discord.Interaction, custom_id: str):
+        """Handle remove button clicks"""
+        # Parse custom_id format: remove_{queue_type}_{guild_id}_{index}
+        parts = custom_id.split('_')
+        if len(parts) != 4:
+            return
+
+        _, queue_type, guild_id_str, index_str = parts
+        try:
+            guild_id = int(guild_id_str)
+            index = int(index_str)
+        except ValueError:
+            return
+
+        # Check if user has permission (in voice channel)
+        if not interaction.user.voice or interaction.user.voice.channel != interaction.guild.voice_client.channel:
+            await interaction.response.send_message("You must be in the voice channel to manage the queue.", ephemeral=True)
+            return
+
+        # Defer the interaction to prevent timeout
+        await interaction.response.defer()
+
+        # Remove the song from the appropriate queue
+        if queue_type == 'priority':
+            if guild_id in self.priority_queues and index < len(self.priority_queues[guild_id]):
+                removed_song = self.priority_queues[guild_id].pop(index)
+                # Update the queue message with new view
+                await self.update_queue_message(interaction)
+            else:
+                await interaction.response.send_message("Song not found in priority queue.", ephemeral=True)
+        elif queue_type == 'regular':
+            if guild_id in self.music_queues and index < len(self.music_queues[guild_id]):
+                removed_song = self.music_queues[guild_id].pop(index)
+
+                # Check if we need to add more songs to maintain 3-song minimum
+                current_regular_count = len(self.music_queues.get(guild_id, []))
+                if current_regular_count < 3:
+                    songs_to_add = 3 - current_regular_count
+                    # Add random songs and wait for completion
+                    await self.add_random_songs(guild_id, min_count=songs_to_add)
+
+                # Update the queue message with new view after songs are added
+                await self.update_queue_message(interaction)
+            else:
+                await interaction.response.send_message("Song not found in regular queue.", ephemeral=True)
+
+    async def handle_queue_button(self, interaction: discord.Interaction, custom_id: str):
+        """Handle queue control button clicks"""
+        # Parse custom_id format: queue_{action}_{guild_id}
+        parts = custom_id.split('_')
+        if len(parts) != 3:
+            return
+
+        _, action, guild_id_str = parts
+        try:
+            guild_id = int(guild_id_str)
+        except ValueError:
+            return
+
+        # Check if user has permission (in voice channel)
+        if not interaction.user.voice or interaction.user.voice.channel != interaction.guild.voice_client.channel:
+            await interaction.response.send_message("You must be in the voice channel to control music.", ephemeral=True)
+            return
+
+        # Defer the interaction to prevent timeout
+        await interaction.response.defer()
+
+        if action == 'skip':
+            # Same logic as skip command
+            if interaction.guild.voice_client is None:
+                await interaction.response.send_message("I'm not currently playing music.", ephemeral=True)
+                return
+
+            if not interaction.guild.voice_client.is_playing():
+                await interaction.response.send_message("No song is currently playing.", ephemeral=True)
+                return
+
+            # Stop current song (this will trigger on_song_end)
+            interaction.guild.voice_client.stop()
+
+            # Ensure we maintain 3 songs in regular queue after skip
+            current_regular_count = len(self.music_queues.get(guild_id, []))
+            if current_regular_count < 3:
+                songs_to_add = 3 - current_regular_count
+                # Add random songs in background without awaiting
+                asyncio.create_task(self.add_random_songs(guild_id, min_count=songs_to_add))
+
+            # Wait a moment for the song transition to complete
+            await asyncio.sleep(0.5)
+
+            # Update the queue message with new view
+            await self.update_queue_message(interaction)
+
+        elif action == 'stop':
+            # Clear all queues and disconnect
+            if guild_id in self.priority_queues:
+                del self.priority_queues[guild_id]
+            if guild_id in self.music_queues:
+                del self.music_queues[guild_id]
+            if guild_id in self.now_playing:
+                del self.now_playing[guild_id]
+
+            # Stop current song and disconnect
+            if interaction.guild.voice_client:
+                if interaction.guild.voice_client.is_playing():
+                    interaction.guild.voice_client.stop()
+                await asyncio.sleep(0.5)  # Brief pause before disconnecting
+                await interaction.guild.voice_client.disconnect()
+
+            # Clear Rich Presence
+            await self.bot.change_presence(activity=None)
+
+            # Update the queue message to show empty state
+            await self.update_queue_message(interaction)
+
+        elif action == 'shuffle':
+            # Shuffle the regular queue
+            if guild_id in self.music_queues and self.music_queues[guild_id]:
+                import random
+                random.shuffle(self.music_queues[guild_id])
+                # Update the queue message with shuffled view
+                await self.update_queue_message(interaction)
+            else:
+                await interaction.response.send_message("No songs in regular queue to shuffle.", ephemeral=True)
+
+    async def update_queue_message(self, interaction: discord.Interaction):
+        """Update the queue message with current state"""
+        guild_id = interaction.guild.id
+
+        # Create updated music player interface using LayoutView
+        view = LayoutView()
+
+        # Check if there's a current song playing
+        if guild_id in self.now_playing:
+            song_info = self.now_playing[guild_id]
+
+            # Try to get album art
+            album_art = None
+            album_art_file = None
+            try:
+                audio = MP3(song_info['file_path'], ID3=ID3)
+                if 'APIC:' in audio:
+                    album_art_data = audio['APIC:'].data
+                    album_art_file = discord.File(BytesIO(album_art_data), filename="album_art.jpg")
+                    album_art = discord.ui.Thumbnail(media=album_art_file)
+            except Exception as e:
+                logger.warning(f"Could not extract album art: {e}")
+
+            # Create container for now playing section
+            full_container = Container()
+            full_container.add_item(Section(
+                TextDisplay(f"# 🎵 Now Playing 🎵"),
+                TextDisplay(f"### {song_info['title']}"),
+                TextDisplay(f"👤 {song_info['artist']} ({song_info.get('duration_str', 'Unknown')})"),
+                accessory=album_art
+            ))
+            view.add_item(full_container)
+
+        full_container.add_item(Separator())
+
+        # Show priority queue (user-requested songs) first
+        priority_count = len(self.priority_queues.get(guild_id, []))
+        regular_count = len(self.music_queues.get(guild_id, []))
+        total_count = priority_count + regular_count
+
+        if total_count > 0:
+            # If priority queue is large, show only priority queue to avoid UI limits
+            if priority_count > 3:
+                # Show only priority queue when it's large
+                full_container.add_item(TextDisplay(f"### ⭐ Priority Queue: ({priority_count})"))
+                priority_to_show = min(6, priority_count)  # Show up to 6 priority items
+
+                for i, song in enumerate(self.priority_queues[guild_id][:priority_to_show], 1):
+                    # Format duration for display
+                    if 'duration' in song and song['duration']:
+                        minutes = song['duration'] // 60
+                        seconds = song['duration'] % 60
+                        duration_str = f"{minutes}:{seconds:02d}"
+                    else:
+                        duration_str = "Unknown"
+                    full_container.add_item(Section(
+                        TextDisplay(f"{i}. **{song['title']}**"),
+                        TextDisplay(f"-# {song['artist']} ({duration_str})"),
+                        accessory=discord.ui.Button(
+                            style=discord.ButtonStyle.secondary,
+                            label="Remove",
+                            custom_id=f"remove_priority_{guild_id}_{i-1}",
+                        )
+                    ))
+
+                if priority_count > priority_to_show:
+                    full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - priority_to_show} more priority songs"))
+
+                # Don't show regular queue when priority is large
+                if regular_count > 0:
+                    full_container.add_item(TextDisplay(f"🎲 {regular_count} regular songs queued after priority"))
+            else:
+                # Show both queues when priority is small
+                # Limit display to avoid hitting 40 child limit
+                max_sections = 8  # Stay well under 40 total children
+                sections_used = 0
+
+                # Show priority queue items first (prioritize these)
+                if priority_count > 0 and sections_used < max_sections:
+                    full_container.add_item(TextDisplay(f"### ⭐ Priority Queue: ({priority_count})"))
+                    priority_to_show = min(3, priority_count, max_sections - sections_used)
+
+                    for i, song in enumerate(self.priority_queues[guild_id][:priority_to_show], 1):
+                        # Format duration for display
+                        if 'duration' in song and song['duration']:
+                            minutes = song['duration'] // 60
+                            seconds = song['duration'] % 60
+                            duration_str = f"{minutes}:{seconds:02d}"
+                        else:
+                            duration_str = "Unknown"
+                        full_container.add_item(Section(
+                            TextDisplay(f"{i}. **{song['title']}**"),
+                            TextDisplay(f"-# {song['artist']} ({duration_str})"),
+                            accessory=discord.ui.Button(
+                                style=discord.ButtonStyle.secondary,
+                                label="Remove",
+                                custom_id=f"remove_priority_{guild_id}_{i-1}",
+                            )
+                        ))
+                        sections_used += 1
+
+                    if priority_count > priority_to_show:
+                        full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - priority_to_show} more priority songs"))
+
+                # Show regular queue items only if we have space
+                if regular_count > 0 and sections_used < max_sections:
+                    remaining_slots = max_sections - sections_used
+                    if priority_count > 0:
+                        full_container.add_item(Separator(visible=False))
+                    full_container.add_item(TextDisplay(f"### 🎲 Regular Queue: ({regular_count})"))
+
+                    # Calculate starting index for regular queue display
+                    start_index = 1
+                    if priority_count > 0:
+                        start_index = priority_count + 1
+
+                    # Show remaining available slots for regular queue
+                    regular_to_show = min(remaining_slots, regular_count)
+                    regular_display = self.music_queues[guild_id][:regular_to_show]
+
+                    for i, song in enumerate(regular_display, start_index):
+                        # Format duration for display
+                        if 'duration' in song and song['duration']:
+                            minutes = song['duration'] // 60
+                            seconds = song['duration'] % 60
+                            duration_str = f"{minutes}:{seconds:02d}"
+                        else:
+                            duration_str = "Unknown"
+                        full_container.add_item(Section(
+                            TextDisplay(f"{i}. **{song['title']}**"),
+                            TextDisplay(f"-# {song['artist']} ({duration_str})"),
+                            accessory=discord.ui.Button(
+                                style=discord.ButtonStyle.secondary,
+                                label="Remove",
+                                custom_id=f"remove_regular_{guild_id}_{i-start_index}",
+                            )
+                        ))
+
+                    remaining_regular = regular_count - len(regular_display)
+                    if remaining_regular > 0:
+                        full_container.add_item(TextDisplay(f"➡️ ... and {remaining_regular} more songs"))
+        else:
+            full_container.add_item(TextDisplay("No songs in queue"))
+
+        # Add control buttons container
+        control_container = Container(
+            ActionRow(
+                discord.ui.Button(
+                    style=discord.ButtonStyle.primary,
+                    label="⏭️ Skip",
+                    custom_id=f"queue_skip_{guild_id}",
+                ),
+                discord.ui.Button(
+                    style=discord.ButtonStyle.danger,
+                    label="⏹️ Stop",
+                    custom_id=f"queue_stop_{guild_id}",
+                ),
+                discord.ui.Button(
+                    style=discord.ButtonStyle.secondary,
+                    label="🔀 Shuffle",
+                    custom_id=f"queue_shuffle_{guild_id}",
+                ),
+            ),
+        )
+        view.add_item(control_container)
+
+        # Update the original message with the new view
+        try:
+            if 'album_art_file' in locals() and album_art_file is not None:
+                await interaction.message.edit(view=view, attachments=[album_art_file])
+            else:
+                await interaction.message.edit(view=view)
+        except Exception as e:
+            logger.warning(f"Could not update queue message: {e}")
+            # Fallback to sending a new message
+            if 'album_art_file' in locals() and album_art_file is not None:
+                await interaction.followup.send(view=view, file=album_art_file, ephemeral=True)
+            else:
+                await interaction.followup.send(view=view, ephemeral=True)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -703,6 +1085,15 @@ class MusicCog(commands.Cog):
 
         # Stop current song (this will trigger on_song_end)
         interaction.guild.voice_client.stop()
+
+        # Ensure we maintain 3 songs in regular queue after skip
+        guild_id = interaction.guild.id
+        current_regular_count = len(self.music_queues.get(guild_id, []))
+        if current_regular_count < 3:
+            songs_to_add = 3 - current_regular_count
+            # Add random songs in background without awaiting
+            asyncio.create_task(self.add_random_songs(guild_id, min_count=songs_to_add))
+
         await interaction.response.send_message("⏭️ Skipped current song!", ephemeral=True)
 
 
