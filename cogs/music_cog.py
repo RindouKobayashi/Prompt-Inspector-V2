@@ -12,6 +12,9 @@ import json
 import os
 from pathlib import Path
 
+# Music cog configuration
+SONGS_DIR = Path(__file__).parent.parent / "songs"
+
 class MusicCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -26,8 +29,8 @@ class MusicCog(commands.Cog):
         self.voice_check_task = None
         self.ALONE_TIMEOUT = 180  # 3 minutes in seconds
         self.EMPTY_CHANNEL_TIMEOUT = 30  # 30 seconds for empty channel
-        self.CACHE_FILE = settings.SONGS_DIR / "song_cache.json"
-        self.STATS_FILE = settings.SONGS_DIR / "song_stats.json"
+        self.CACHE_FILE = SONGS_DIR / "song_cache.json"
+        self.STATS_FILE = SONGS_DIR / "song_stats.json"
         self.song_stats = {}  # file_path -> stats dict
         self.current_play_start = {}  # guild_id -> timestamp when current song started
         self.skip_in_progress = {}  # guild_id -> bool (True if song is being skipped)
@@ -50,7 +53,7 @@ class MusicCog(commands.Cog):
 
                 def get_song_metadata():
                     songs_with_metadata = []
-                    for mp3_file in settings.SONGS_DIR.glob("**/*.mp3"):
+                    for mp3_file in SONGS_DIR.glob("**/*.mp3"):
                         try:
                             audio = MP3(mp3_file, ID3=ID3)
                             title = audio.get('TIT2', mp3_file.stem).text[0] if audio.get('TIT2') else mp3_file.stem
@@ -458,7 +461,7 @@ class MusicCog(commands.Cog):
 
                 # Check if cache is still valid (files haven't changed)
                 cached_files = set(cache_data.get('files', []))
-                current_files = set(str(f) for f in settings.SONGS_DIR.glob("**/*.mp3"))
+                current_files = set(str(f) for f in SONGS_DIR.glob("**/*.mp3"))
 
                 if cached_files == current_files:
                     self.song_cache = cache_data['songs']
@@ -478,7 +481,7 @@ class MusicCog(commands.Cog):
             cache_data = {
                 'songs': self.song_cache,
                 'timestamp': self.cache_timestamp,
-                'files': [str(f) for f in settings.SONGS_DIR.glob("**/*.mp3")]
+            'files': [str(f) for f in SONGS_DIR.glob("**/*.mp3")]
             }
 
             # Ensure directory exists
@@ -486,6 +489,8 @@ class MusicCog(commands.Cog):
 
             with open(self.CACHE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"Saved song cache to file: {len(self.song_cache)} songs")
 
             logger.info(f"Saved song cache to file: {len(self.song_cache)} songs")
         except Exception as e:
@@ -1308,7 +1313,7 @@ class MusicCog(commands.Cog):
             if self.STATS_FILE.exists():
                 with open(self.STATS_FILE, 'r', encoding='utf-8') as f:
                     self.song_stats = json.load(f)
-                logger.info(f"Loaded song stats for {len(self.song_stats)} songs")
+                #logger.info(f"Loaded song stats for {len(self.song_stats)} songs")
             else:
                 self.song_stats = {}
                 logger.info("No existing song stats file found, starting fresh")
@@ -1671,10 +1676,6 @@ class MusicCog(commands.Cog):
                     break
 
             if song_info:
-                # Calculate skip rate
-                total_interactions = stats['total_plays'] + stats['skips']
-                skip_rate = (stats['skips'] / total_interactions * 100) if total_interactions > 0 else 0
-
                 top_container.add_item(TextDisplay(f"#{i} **{song_info['title']}**"))
                 top_container.add_item(TextDisplay(f"👤 {song_info['artist']} • 🎵 {stats['started_plays']} plays"))
 
