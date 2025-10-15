@@ -21,13 +21,21 @@ class MusicCog(commands.Cog):
         self.music_queues = {}  # guild_id -> list of song_info dicts
         self.now_playing = {}   # guild_id -> current song_info dict
         self.priority_queues = {}  # guild_id -> list of priority song_info dicts
+        self.pause_states = {}  # guild_id -> bool (True if paused)
+        self.loop_modes = {}   # guild_id -> str ('off', 'single', 'queue')
         self.voice_check_task = None
         self.ALONE_TIMEOUT = 180  # 3 minutes in seconds
         self.EMPTY_CHANNEL_TIMEOUT = 30  # 30 seconds for empty channel
         self.CACHE_FILE = settings.SONGS_DIR / "song_cache.json"
+        self.STATS_FILE = settings.SONGS_DIR / "song_stats.json"
+        self.song_stats = {}  # file_path -> stats dict
+        self.current_play_start = {}  # guild_id -> timestamp when current song started
+        self.skip_in_progress = {}  # guild_id -> bool (True if song is being skipped)
+        self.current_queue_type = {}  # guild_id -> str ('priority' or 'regular') for currently playing song
 
         # Create initial cache on startup
         asyncio.create_task(self.initialize_cache())
+        asyncio.create_task(self.load_song_stats())
 
     async def initialize_cache(self):
         """Initialize song cache on startup"""
@@ -140,6 +148,8 @@ class MusicCog(commands.Cog):
             if is_playing:
                 # Add to priority queue (user-requested songs get priority)
                 self.priority_queues[guild_id].append(song_info)
+                # Update stats for priority queue addition
+                self.update_song_stats(song_info['file_path'], event_type='queued', queue_type='priority', user_id=str(interaction.user.id))
                 # Calculate position in combined queue (priority songs play first)
                 queue_position = len(self.priority_queues[guild_id])
 
@@ -193,11 +203,11 @@ class MusicCog(commands.Cog):
                     songs_to_add = 3 - current_regular_count
                     await self.add_random_songs(guild_id, min_count=songs_to_add)
 
-                await self.play_song(interaction, song_info)
+                await self.play_song(interaction, song_info, queue_type='priority', user_id=str(interaction.user.id))
         else:
             await interaction.followup.send(f"Could not load song info for: {song_name}")
 
-    async def play_song(self, interaction: discord.Interaction, song_info: dict, send_message: bool = True):
+    async def play_song(self, interaction: discord.Interaction, song_info: dict, send_message: bool = True, queue_type: str = 'regular', user_id: str = None):
         """Play a song and set up the music interface"""
         # Try to get album art
         album_art = None
@@ -254,6 +264,12 @@ class MusicCog(commands.Cog):
             else:
                 await interaction.followup.send(view=view)
 
+        # Record play start time and update stats for song start
+        guild_id = interaction.guild.id
+        self.current_play_start[guild_id] = asyncio.get_event_loop().time()
+        self.current_queue_type[guild_id] = queue_type
+        self.update_song_stats(song_info['file_path'], event_type='started', queue_type=queue_type, user_id=user_id)
+
         # Play the song
         try:
             source = discord.FFmpegPCMAudio(str(song_info['file_path']))
@@ -270,6 +286,28 @@ class MusicCog(commands.Cog):
 
         # Check if bot is still connected to voice - if not, don't try to play next song
         if not interaction.guild.voice_client or not interaction.guild.voice_client.is_connected():
+            # Record play duration for the song that just finished
+            if guild_id in self.now_playing and guild_id in self.current_play_start:
+                song_info = self.now_playing[guild_id]
+                play_duration = asyncio.get_event_loop().time() - self.current_play_start[guild_id]
+
+                # Always record play duration (even for skipped songs)
+                self.record_play_duration(song_info['file_path'], play_duration)
+
+                # Record appropriate event type
+                current_type = self.current_queue_type.get(guild_id, 'regular')
+                if not self.skip_in_progress.get(guild_id, False):
+                    # Record completion event
+                    self.update_song_stats(song_info['file_path'], event_type='completed', queue_type=current_type)
+                else:
+                    # Record skip event
+                    self.update_song_stats(song_info['file_path'], event_type='skipped', queue_type=current_type)
+
+                    del self.current_play_start[guild_id]
+                    # Clear skip flag
+                    if guild_id in self.skip_in_progress:
+                        del self.skip_in_progress[guild_id]
+
             # Clear now playing for this guild since we're disconnected
             if guild_id in self.now_playing:
                 del self.now_playing[guild_id]
@@ -277,12 +315,53 @@ class MusicCog(commands.Cog):
             await self.bot.change_presence(activity=None)
             return
 
+        # Record play duration for the song that just finished (always record duration and session)
+        if guild_id in self.now_playing and guild_id in self.current_play_start:
+            song_info = self.now_playing[guild_id]
+            play_duration = asyncio.get_event_loop().time() - self.current_play_start[guild_id]
+
+            # Always record play duration and session (even for skipped songs)
+            self.record_play_duration(song_info['file_path'], play_duration)
+
+            # Record appropriate event type
+            current_type = self.current_queue_type.get(guild_id, 'regular')
+            if not self.skip_in_progress.get(guild_id, False):
+                # Record completion event
+                self.update_song_stats(song_info['file_path'], event_type='completed', queue_type=current_type)
+            else:
+                # Record skip event
+                self.update_song_stats(song_info['file_path'], event_type='skipped', queue_type=current_type)
+
+            del self.current_play_start[guild_id]
+            # Clear skip flag
+            if guild_id in self.skip_in_progress:
+                del self.skip_in_progress[guild_id]
+
+        # Check loop mode first
+        current_loop_mode = self.loop_modes.get(guild_id, 'off')
+
+        if current_loop_mode == 'single' and guild_id in self.now_playing:
+            # Loop current song
+            current_song = self.now_playing[guild_id]
+            await self.play_song(interaction, current_song, send_message=False)
+            return
+
+        elif current_loop_mode == 'queue':
+            # Loop entire queue - add current song back to end of regular queue
+            if guild_id in self.now_playing:
+                current_song = self.now_playing[guild_id]
+                # Initialize queue if needed
+                if guild_id not in self.music_queues:
+                    self.music_queues[guild_id] = []
+                # Add current song to end of queue
+                self.music_queues[guild_id].append(current_song)
+
         # Check priority queue first (user-added songs)
         if guild_id in self.priority_queues and self.priority_queues[guild_id]:
             # Play next priority song
             next_song = self.priority_queues[guild_id].pop(0)
             self.now_playing[guild_id] = next_song
-            await self.play_song(interaction, next_song, send_message=False)
+            await self.play_song(interaction, next_song, send_message=False, queue_type='priority')
             return
 
         # Check if there are songs in regular queue
@@ -298,7 +377,7 @@ class MusicCog(commands.Cog):
                 # Add random songs in background without awaiting
                 asyncio.create_task(self.add_random_songs(guild_id, min_count=songs_to_add))
 
-            await self.play_song(interaction, next_song, send_message=False)
+            await self.play_song(interaction, next_song, send_message=False, queue_type='regular')
         else:
             # No more songs in regular queue, add random songs
             await self.add_random_songs(guild_id)
@@ -364,6 +443,10 @@ class MusicCog(commands.Cog):
 
         # Add random songs to queue
         self.music_queues[guild_id].extend(random_songs)
+
+        # Update stats for each randomly added song
+        for song in random_songs:
+            self.update_song_stats(song['file_path'], event_type='queued', queue_type='regular')
 
 
     def load_song_cache(self):
@@ -453,8 +536,22 @@ class MusicCog(commands.Cog):
         await interaction.response.defer()
         guild_id = interaction.guild.id
 
+        # Show priority queue (user-requested songs) first
+        priority_count = len(self.priority_queues.get(guild_id, []))
+        regular_count = len(self.music_queues.get(guild_id, []))
+        total_count = priority_count + regular_count
+
+        # If no songs in queue, just send a simple message and delete it
+        if total_count == 0:
+            message: discord.Message = await interaction.followup.send("No songs in queue")
+            await message.delete(delay=10)
+            return
+
         # Create music player interface using LayoutView
         view = LayoutView()
+
+        # Create container for the queue display
+        full_container = Container()
 
         # Check if there's a current song playing
         if guild_id in self.now_playing:
@@ -472,31 +569,58 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 logger.warning(f"Could not extract album art: {e}")
 
-            # Create container for now playing section
-            full_container = Container()
+            # Add now playing section
             full_container.add_item(Section(
                 TextDisplay(f"# 🎵 Now Playing 🎵"),
                 TextDisplay(f"### {song_info['title']}"),
                 TextDisplay(f"👤 {song_info['artist']} ({song_info.get('duration_str', 'Unknown')})"),
                 accessory=album_art
             ))
-            view.add_item(full_container)
+
+        view.add_item(full_container)
 
         full_container.add_item(Separator())
 
-        # Show priority queue (user-requested songs) first
-        priority_count = len(self.priority_queues.get(guild_id, []))
-        regular_count = len(self.music_queues.get(guild_id, []))
-        total_count = priority_count + regular_count
+        # If priority queue is large, show only priority queue to avoid UI limits
+        if priority_count > 3:
+            # Show only priority queue when it's large
+            full_container.add_item(TextDisplay(f"### ⭐ Priority Queue: ({priority_count})"))
+            priority_to_show = min(6, priority_count)  # Show up to 6 priority items
 
+            for i, song in enumerate(self.priority_queues[guild_id][:priority_to_show], 1):
+                # Format duration for display
+                if 'duration' in song and song['duration']:
+                    minutes = song['duration'] // 60
+                    seconds = song['duration'] % 60
+                    duration_str = f"{minutes}:{seconds:02d}"
+                else:
+                    duration_str = "Unknown"
+                full_container.add_item(Section(
+                    TextDisplay(f"{i}. **{song['title']}**"),
+                    TextDisplay(f"-# {song['artist']} ({duration_str})"),
+                    accessory=discord.ui.Button(
+                        style=discord.ButtonStyle.secondary,
+                        label="Remove",
+                        custom_id=f"remove_priority_{guild_id}_{i-1}",
+                    )
+                ))
 
+            if priority_count > priority_to_show:
+                full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - priority_to_show} more priority songs"))
 
-        if total_count > 0:
-            # If priority queue is large, show only priority queue to avoid UI limits
-            if priority_count > 3:
-                # Show only priority queue when it's large
+            # Don't show regular queue when priority is large
+            if regular_count > 0:
+                full_container.add_item(TextDisplay(f"🎲 {regular_count} regular songs queued after priority"))
+        else:
+            # Show both queues when priority is small
+            # Limit display to avoid hitting 40 child limit
+            max_sections = 8  # Stay well under 40 total children
+            sections_used = 0
+
+            # Show priority queue items first (prioritize these)
+            if priority_count > 0 and sections_used < max_sections:
                 full_container.add_item(TextDisplay(f"### ⭐ Priority Queue: ({priority_count})"))
-                priority_to_show = min(6, priority_count)  # Show up to 6 priority items
+                priority_to_show = min(3, priority_count, max_sections - sections_used)
 
                 for i, song in enumerate(self.priority_queues[guild_id][:priority_to_show], 1):
                     # Format duration for display
@@ -515,103 +639,101 @@ class MusicCog(commands.Cog):
                             custom_id=f"remove_priority_{guild_id}_{i-1}",
                         )
                     ))
+                    sections_used += 1
 
                 if priority_count > priority_to_show:
                     full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - priority_to_show} more priority songs"))
 
-                # Don't show regular queue when priority is large
-                if regular_count > 0:
-                    full_container.add_item(TextDisplay(f"🎲 {regular_count} regular songs queued after priority"))
-            else:
-                # Show both queues when priority is small
-                # Limit display to avoid hitting 40 child limit
-                max_sections = 8  # Stay well under 40 total children
-                sections_used = 0
+            # Show regular queue items only if we have space
+            if regular_count > 0 and sections_used < max_sections:
+                remaining_slots = max_sections - sections_used
+                if priority_count > 0:
+                    full_container.add_item(Separator(visible=False))
+                full_container.add_item(TextDisplay(f"### 🎲 Regular Queue: ({regular_count})"))
 
-                # Show priority queue items first (prioritize these)
-                if priority_count > 0 and sections_used < max_sections:
-                    full_container.add_item(TextDisplay(f"### ⭐ Priority Queue: ({priority_count})"))
-                    priority_to_show = min(3, priority_count, max_sections - sections_used)
+                # Calculate starting index for regular queue display
+                start_index = 1
+                if priority_count > 0:
+                    start_index = priority_count + 1
 
-                    for i, song in enumerate(self.priority_queues[guild_id][:priority_to_show], 1):
-                        # Format duration for display
-                        if 'duration' in song and song['duration']:
-                            minutes = song['duration'] // 60
-                            seconds = song['duration'] % 60
-                            duration_str = f"{minutes}:{seconds:02d}"
-                        else:
-                            duration_str = "Unknown"
-                        full_container.add_item(Section(
-                            TextDisplay(f"{i}. **{song['title']}**"),
-                            TextDisplay(f"-# {song['artist']} ({duration_str})"),
-                            accessory=discord.ui.Button(
-                                style=discord.ButtonStyle.secondary,
-                                label="Remove",
-                                custom_id=f"remove_priority_{guild_id}_{i-1}",
-                            )
-                        ))
-                        sections_used += 1
+                # Show remaining available slots for regular queue
+                regular_to_show = min(remaining_slots, regular_count)
+                regular_display = self.music_queues[guild_id][:regular_to_show]
 
-                    if priority_count > priority_to_show:
-                        full_container.add_item(TextDisplay(f"⭐ ... and {priority_count - priority_to_show} more priority songs"))
+                for i, song in enumerate(regular_display, start_index):
+                    # Format duration for display
+                    if 'duration' in song and song['duration']:
+                        minutes = song['duration'] // 60
+                        seconds = song['duration'] % 60
+                        duration_str = f"{minutes}:{seconds:02d}"
+                    else:
+                        duration_str = "Unknown"
+                    full_container.add_item(Section(
+                        TextDisplay(f"{i}. **{song['title']}**"),
+                        TextDisplay(f"-# {song['artist']} ({duration_str})"),
+                        accessory=discord.ui.Button(
+                            style=discord.ButtonStyle.secondary,
+                            label="Remove",
+                            custom_id=f"remove_regular_{guild_id}_{i-start_index}",
+                        )
+                    ))
 
-                # Show regular queue items only if we have space
-                if regular_count > 0 and sections_used < max_sections:
-                    remaining_slots = max_sections - sections_used
-                    if priority_count > 0:
-                        full_container.add_item(Separator(visible=False))
-                    full_container.add_item(TextDisplay(f"### 🎲 Regular Queue: ({regular_count})"))
+                remaining_regular = regular_count - len(regular_display)
+                if remaining_regular > 0:
+                    full_container.add_item(TextDisplay(f"➡️ ... and {remaining_regular} more songs"))
 
-                    # Calculate starting index for regular queue display
-                    start_index = 1
-                    if priority_count > 0:
-                        start_index = priority_count + 1
+        # Determine pause/resume button state
+        is_paused = self.pause_states.get(guild_id, False)
+        pause_label = "Resume" if is_paused else "Pause"
+        pause_emoji = "▶️" if is_paused else "⏸️"
 
-                    # Show remaining available slots for regular queue
-                    regular_to_show = min(remaining_slots, regular_count)
-                    regular_display = self.music_queues[guild_id][:regular_to_show]
-
-                    for i, song in enumerate(regular_display, start_index):
-                        # Format duration for display
-                        if 'duration' in song and song['duration']:
-                            minutes = song['duration'] // 60
-                            seconds = song['duration'] % 60
-                            duration_str = f"{minutes}:{seconds:02d}"
-                        else:
-                            duration_str = "Unknown"
-                        full_container.add_item(Section(
-                            TextDisplay(f"{i}. **{song['title']}**"),
-                            TextDisplay(f"-# {song['artist']} ({duration_str})"),
-                            accessory=discord.ui.Button(
-                                style=discord.ButtonStyle.secondary,
-                                label="Remove",
-                                custom_id=f"remove_regular_{guild_id}_{i-start_index}",
-                            )
-                        ))
-
-                    remaining_regular = regular_count - len(regular_display)
-                    if remaining_regular > 0:
-                        full_container.add_item(TextDisplay(f"➡️ ... and {remaining_regular} more songs"))
-        else:
-            full_container.add_item(TextDisplay("No songs in queue"))
+        # Determine loop button state
+        current_loop_mode = self.loop_modes.get(guild_id, 'off')
+        if current_loop_mode == 'off':
+            loop_label = "Loop: Off"
+            loop_emoji = "🔁"
+            loop_style = discord.ButtonStyle.secondary
+        elif current_loop_mode == 'single':
+            loop_label = "Loop: Single"
+            loop_emoji = "🔂"
+            loop_style = discord.ButtonStyle.primary
+        elif current_loop_mode == 'queue':
+            loop_label = "Loop: Queue"
+            loop_emoji = "🔁"
+            loop_style = discord.ButtonStyle.primary
 
         # Add control buttons container
         control_container = Container(
             ActionRow(
                 discord.ui.Button(
+                    style=discord.ButtonStyle.secondary,
+                    label=pause_label,
+                    emoji=pause_emoji,
+                    custom_id=f"queue_pause_{guild_id}",
+                ),
+                discord.ui.Button(
                     style=discord.ButtonStyle.primary,
-                    label="⏭️ Skip",
+                    label="Skip",
+                    emoji="⏭️",
                     custom_id=f"queue_skip_{guild_id}",
                 ),
                 discord.ui.Button(
-                    style=discord.ButtonStyle.danger,
-                    label="⏹️ Stop",
-                    custom_id=f"queue_stop_{guild_id}",
+                    style=loop_style,
+                    label=loop_label,
+                    emoji=loop_emoji,
+                    custom_id=f"queue_loop_{guild_id}",
                 ),
                 discord.ui.Button(
                     style=discord.ButtonStyle.secondary,
-                    label="🔀 Shuffle",
-                    custom_id=f"queue_shuffle_{guild_id}",
+                    label="Clear Queue",
+                    emoji="🧹",
+                    custom_id=f"queue_clear_{guild_id}",
+                ),
+                discord.ui.Button(
+                    style=discord.ButtonStyle.danger,
+                    label="Stop",
+                    emoji="⏹️",
+                    custom_id=f"queue_stop_{guild_id}",
                 ),
             ),
         )
@@ -632,6 +754,8 @@ class MusicCog(commands.Cog):
                 await self.handle_remove_button(interaction, custom_id)
             elif custom_id.startswith('queue_'):
                 await self.handle_queue_button(interaction, custom_id)
+            elif custom_id.startswith('play_again_'):
+                await self.handle_play_again_button(interaction, custom_id)
 
     async def handle_remove_button(self, interaction: discord.Interaction, custom_id: str):
         """Handle remove button clicks"""
@@ -710,6 +834,9 @@ class MusicCog(commands.Cog):
                 await interaction.response.send_message("No song is currently playing.", ephemeral=True)
                 return
 
+            # Mark as skip in progress (on_song_end will handle the stats recording)
+            self.skip_in_progress[guild_id] = True
+
             # Stop current song (this will trigger on_song_end)
             interaction.guild.voice_client.stop()
 
@@ -745,8 +872,76 @@ class MusicCog(commands.Cog):
             # Clear Rich Presence
             await self.bot.change_presence(activity=None)
 
-            # Update the queue message to show empty state
+            # Create a stopped message with no buttons
+            view = LayoutView()
+            stopped_container = Container()
+            stopped_container.add_item(Section(
+                TextDisplay("⏹️ **Music Stopped**"),
+                TextDisplay("All queues cleared and disconnected from voice channel."),
+                TextDisplay("-# Use `/play` to start playing music again"),
+                accessory=discord.ui.Button(
+                    style=discord.ButtonStyle.primary,
+                    label="Play Again",
+                    emoji="▶️",
+                    custom_id=f"play_again_{guild_id}",
+                )
+            ))
+            view.add_item(stopped_container)
+
+            # Update the message with stopped state (no action row)
+            try:
+                await interaction.message.edit(view=view)
+            except Exception as e:
+                logger.warning(f"Could not update stop message: {e}")
+                await interaction.followup.send(view=view, ephemeral=True)
+
+        elif action == 'pause':
+            # Toggle pause/resume
+            if interaction.guild.voice_client:
+                if interaction.guild.voice_client.is_playing():
+                    interaction.guild.voice_client.pause()
+                    self.pause_states[guild_id] = True
+                    # Update the queue message with paused state
+                    await self.update_queue_message(interaction)
+                elif interaction.guild.voice_client.is_paused():
+                    interaction.guild.voice_client.resume()
+                    self.pause_states[guild_id] = False
+                    # Update the queue message with resumed state
+                    await self.update_queue_message(interaction)
+                else:
+                    await interaction.response.send_message("No song is currently playing.", ephemeral=True)
+            else:
+                await interaction.response.send_message("I'm not currently playing music.", ephemeral=True)
+
+        elif action == 'loop':
+            # Cycle through loop modes: off -> single -> queue -> off
+            current_mode = self.loop_modes.get(guild_id, 'off')
+            if current_mode == 'off':
+                self.loop_modes[guild_id] = 'single'
+            elif current_mode == 'single':
+                self.loop_modes[guild_id] = 'queue'
+            elif current_mode == 'queue':
+                self.loop_modes[guild_id] = 'off'
+            # Update the queue message to show new loop mode
             await self.update_queue_message(interaction)
+
+        elif action == 'clear':
+            # Clear all songs from both priority and regular queues
+            cleared_anything = False
+            if guild_id in self.priority_queues:
+                self.priority_queues[guild_id].clear()
+                cleared_anything = True
+            if guild_id in self.music_queues:
+                self.music_queues[guild_id].clear()
+                cleared_anything = True
+
+            if cleared_anything:
+                # Add back 3 random songs to maintain minimum
+                await self.add_random_songs(guild_id, min_count=3)
+                # Update the queue message with cleared state
+                await self.update_queue_message(interaction)
+            else:
+                await interaction.response.send_message("No songs in queue to clear.", ephemeral=True)
 
         elif action == 'shuffle':
             # Shuffle the regular queue
@@ -765,6 +960,9 @@ class MusicCog(commands.Cog):
         # Create updated music player interface using LayoutView
         view = LayoutView()
 
+        # Create container for the queue display
+        full_container = Container()
+
         # Check if there's a current song playing
         if guild_id in self.now_playing:
             song_info = self.now_playing[guild_id]
@@ -781,15 +979,15 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 logger.warning(f"Could not extract album art: {e}")
 
-            # Create container for now playing section
-            full_container = Container()
+            # Add now playing section
             full_container.add_item(Section(
                 TextDisplay(f"# 🎵 Now Playing 🎵"),
                 TextDisplay(f"### {song_info['title']}"),
                 TextDisplay(f"👤 {song_info['artist']} ({song_info.get('duration_str', 'Unknown')})"),
                 accessory=album_art
             ))
-            view.add_item(full_container)
+
+        view.add_item(full_container)
 
         full_container.add_item(Separator())
 
@@ -902,23 +1100,58 @@ class MusicCog(commands.Cog):
         else:
             full_container.add_item(TextDisplay("No songs in queue"))
 
+        # Determine pause/resume button state
+        is_paused = self.pause_states.get(guild_id, False)
+        pause_label = "Resume" if is_paused else "Pause"
+        pause_emoji = "▶️" if is_paused else "⏸️"
+
+        # Determine loop button state
+        current_loop_mode = self.loop_modes.get(guild_id, 'off')
+        if current_loop_mode == 'off':
+            loop_label = "Loop: Off"
+            loop_emoji = "🔁"
+            loop_style = discord.ButtonStyle.secondary
+        elif current_loop_mode == 'single':
+            loop_label = "Loop: Single"
+            loop_emoji = "🔂"
+            loop_style = discord.ButtonStyle.primary
+        elif current_loop_mode == 'queue':
+            loop_label = "Loop: Queue"
+            loop_emoji = "🔁"
+            loop_style = discord.ButtonStyle.primary
+
         # Add control buttons container
         control_container = Container(
             ActionRow(
                 discord.ui.Button(
+                    style=discord.ButtonStyle.secondary,
+                    label=pause_label,
+                    emoji=pause_emoji,
+                    custom_id=f"queue_pause_{guild_id}",
+                ),
+                discord.ui.Button(
                     style=discord.ButtonStyle.primary,
-                    label="⏭️ Skip",
+                    label="Skip",
+                    emoji="⏭️",
                     custom_id=f"queue_skip_{guild_id}",
                 ),
                 discord.ui.Button(
-                    style=discord.ButtonStyle.danger,
-                    label="⏹️ Stop",
-                    custom_id=f"queue_stop_{guild_id}",
+                    style=loop_style,
+                    label=loop_label,
+                    emoji=loop_emoji,
+                    custom_id=f"queue_loop_{guild_id}",
                 ),
                 discord.ui.Button(
                     style=discord.ButtonStyle.secondary,
-                    label="🔀 Shuffle",
-                    custom_id=f"queue_shuffle_{guild_id}",
+                    label="Clear Queue",
+                    emoji="🧹",
+                    custom_id=f"queue_clear_{guild_id}",
+                ),
+                discord.ui.Button(
+                    style=discord.ButtonStyle.danger,
+                    label="Stop",
+                    emoji="⏹️",
+                    custom_id=f"queue_stop_{guild_id}",
                 ),
             ),
         )
@@ -1069,6 +1302,206 @@ class MusicCog(commands.Cog):
         except Exception as e:
             logger.error(f"Error in scheduled disconnect: {e}")
 
+    async def load_song_stats(self):
+        """Load song statistics from file on startup"""
+        try:
+            if self.STATS_FILE.exists():
+                with open(self.STATS_FILE, 'r', encoding='utf-8') as f:
+                    self.song_stats = json.load(f)
+                logger.info(f"Loaded song stats for {len(self.song_stats)} songs")
+            else:
+                self.song_stats = {}
+                logger.info("No existing song stats file found, starting fresh")
+        except Exception as e:
+            logger.error(f"Failed to load song stats: {e}")
+            self.song_stats = {}
+
+    def save_song_stats(self):
+        """Save song statistics to file"""
+        try:
+            # Ensure directory exists
+            self.STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(self.STATS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.song_stats, f, ensure_ascii=False, indent=2)
+
+            #logger.info(f"Saved song stats for {len(self.song_stats)} songs")
+        except Exception as e:
+            logger.error(f"Failed to save song stats: {e}")
+
+    def update_song_stats(self, file_path: str, event_type: str = 'queued', queue_type: str = 'regular', user_id: str = None):
+        """Update statistics for a song
+
+        event_type: 'queued' (added to queue), 'started' (began playing), 'completed' (finished playing), 'skipped' (was skipped)
+        queue_type: 'priority' or 'regular' (only used for queued events)
+        """
+        import time
+        current_time = time.time()
+
+        if file_path not in self.song_stats:
+            self.song_stats[file_path] = {
+                # Queue tracking
+                'queued_total': 0,
+                'queued_priority': 0,
+                'queued_regular': 0,
+                'first_queued': current_time,
+                'last_queued': current_time,
+
+                # Playback tracking
+                'started_plays': 0,
+                'started_priority': 0,
+                'started_regular': 0,
+                'completed_plays': 0,
+                'completed_priority': 0,
+                'completed_regular': 0,
+                'skipped_plays': 0,
+                'skipped_priority': 0,
+                'skipped_regular': 0,
+                'first_played': None,
+                'last_played': None,
+
+                # Time tracking
+                'total_play_time': 0,
+                'play_sessions': [],
+
+                # User tracking
+                'request_users': {}
+            }
+
+        stats = self.song_stats[file_path]
+
+        if event_type == 'queued':
+            # Song was added to a queue
+            stats['queued_total'] += 1
+            if queue_type == 'priority':
+                stats['queued_priority'] += 1
+            else:
+                stats['queued_regular'] += 1
+            stats['last_queued'] = current_time
+
+            # Track requesting user
+            if user_id:
+                user_key = str(user_id)
+                if user_key not in stats['request_users']:
+                    stats['request_users'][user_key] = 0
+                stats['request_users'][user_key] += 1
+
+        elif event_type == 'started':
+            # Song actually started playing
+            stats['started_plays'] += 1
+            if queue_type == 'priority':
+                stats['started_priority'] += 1
+            else:
+                stats['started_regular'] += 1
+            if stats['first_played'] is None:
+                stats['first_played'] = current_time
+            stats['last_played'] = current_time
+
+            # Track requesting user for started songs (for immediate plays)
+            if user_id:
+                user_key = str(user_id)
+                if user_key not in stats['request_users']:
+                    stats['request_users'][user_key] = 0
+                stats['request_users'][user_key] += 1
+
+        elif event_type == 'completed':
+            # Song finished playing completely
+            stats['completed_plays'] += 1
+            if queue_type == 'priority':
+                stats['completed_priority'] += 1
+            else:
+                stats['completed_regular'] += 1
+
+        elif event_type == 'skipped':
+            # Song was skipped during playback
+            stats['skipped_plays'] += 1
+            if queue_type == 'priority':
+                stats['skipped_priority'] += 1
+            else:
+                stats['skipped_regular'] += 1
+
+        # Save stats after every update for now (can be optimized later)
+        self.save_song_stats()
+
+    def record_skip(self, file_path: str):
+        """Record a skip for a song"""
+        if file_path in self.song_stats:
+            self.song_stats[file_path]['skips'] += 1
+
+    def record_play_duration(self, file_path: str, duration: float):
+        """Record the duration a song was played"""
+        if file_path in self.song_stats:
+            self.song_stats[file_path]['total_play_time'] += duration
+            self.song_stats[file_path]['play_sessions'].append(duration)
+
+            # Keep only last 100 sessions to prevent unlimited growth
+            if len(self.song_stats[file_path]['play_sessions']) > 100:
+                self.song_stats[file_path]['play_sessions'] = self.song_stats[file_path]['play_sessions'][-100:]
+
+    async def handle_play_again_button(self, interaction: discord.Interaction, custom_id: str):
+        """Handle play again button clicks"""
+        # Parse custom_id format: play_again_{guild_id}
+        parts = custom_id.split('_')
+        if len(parts) != 3:
+            return
+
+        _, _, guild_id_str = parts
+        try:
+            guild_id = int(guild_id_str)
+        except ValueError:
+            return
+
+        # Check if user is in voice channel
+        if not interaction.user.voice:
+            await interaction.response.send_message("You are not connected to a voice channel.", ephemeral=True)
+            return
+
+        # Check bot permissions for voice channel
+        bot_member = interaction.guild.get_member(self.bot.user.id)
+        if not interaction.user.voice.channel.permissions_for(bot_member).connect:
+            await interaction.response.send_message("I don't have permission to connect to your voice channel.", ephemeral=True)
+            return
+        if not interaction.user.voice.channel.permissions_for(bot_member).speak:
+            await interaction.response.send_message("I don't have permission to speak in your voice channel.", ephemeral=True)
+            return
+
+        # Check if bot is already in a different voice channel
+        if interaction.guild.voice_client is not None:
+            if interaction.guild.voice_client.channel != interaction.user.voice.channel:
+                await interaction.response.send_message("I'm already connected to a different voice channel.", ephemeral=True)
+                return
+        else:
+            # Bot not connected, join the channel
+            await interaction.user.voice.channel.connect()
+
+        # Defer the interaction to prevent timeout
+        await interaction.response.defer()
+
+        # Add 3 random songs to start playing again
+        await self.add_random_songs(guild_id, min_count=3)
+
+        # Ensure we have at least 3 songs in the queue before proceeding
+        current_queue_count = len(self.music_queues.get(guild_id, []))
+        if current_queue_count < 3:
+            # Try to add more songs if we don't have enough
+            additional_needed = 3 - current_queue_count
+            await self.add_random_songs(guild_id, min_count=additional_needed)
+
+        # Try to play the first song
+        if guild_id in self.music_queues and self.music_queues[guild_id]:
+            next_song = self.music_queues[guild_id].pop(0)
+            self.now_playing[guild_id] = next_song
+            # Play the song without sending a message
+            await self.play_song(interaction, next_song, send_message=False)
+
+            # Wait a moment for the song to start
+            await asyncio.sleep(0.5)
+
+            # Update the message with the full queue view
+            await self.update_queue_message(interaction)
+        else:
+            await interaction.response.send_message("No songs available to play.", ephemeral=True)
+
     @app_commands.command(name="skip", description="Skip the current song")
     async def skip(self, interaction: discord.Interaction):
         if interaction.user.voice is None:
@@ -1083,11 +1516,14 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("No song is currently playing.", ephemeral=True)
             return
 
+        # Mark as skip in progress (on_song_end will handle the stats recording)
+        guild_id = interaction.guild.id
+        self.skip_in_progress[guild_id] = True
+
         # Stop current song (this will trigger on_song_end)
         interaction.guild.voice_client.stop()
 
         # Ensure we maintain 3 songs in regular queue after skip
-        guild_id = interaction.guild.id
         current_regular_count = len(self.music_queues.get(guild_id, []))
         if current_regular_count < 3:
             songs_to_add = 3 - current_regular_count
@@ -1095,6 +1531,201 @@ class MusicCog(commands.Cog):
             asyncio.create_task(self.add_random_songs(guild_id, min_count=songs_to_add))
 
         await interaction.response.send_message("⏭️ Skipped current song!", ephemeral=True)
+
+    @app_commands.command(name="songstats", description="Show statistics for a specific song")
+    @app_commands.describe(song_name="Name of the song to get stats for")
+    async def songstats(self, interaction: discord.Interaction, song_name: str):
+        await interaction.response.defer()
+
+        # Find the song in cache
+        song_info = None
+        for song in self.song_cache:
+            if song['display_name'] == song_name:
+                song_info = song
+                break
+
+        if not song_info:
+            await interaction.response.send_message(f"Song `{song_name}` not found in library.", ephemeral=True)
+            return
+
+        # Get stats for this song
+        file_path = song_info['file_path']
+        if file_path not in self.song_stats:
+            await interaction.response.send_message(f"No statistics available for `{song_name}` yet.", ephemeral=True)
+            return
+
+        stats = self.song_stats[file_path]
+
+        # Format the stats display
+        import time
+        from datetime import datetime
+
+        # Calculate average play duration
+        avg_duration = 0
+        if stats['play_sessions']:
+            avg_duration = sum(stats['play_sessions']) / len(stats['play_sessions'])
+
+        # Format timestamps
+        first_played = datetime.fromtimestamp(stats['first_played']).strftime('%Y-%m-%d %H:%M')
+        last_played = datetime.fromtimestamp(stats['last_played']).strftime('%Y-%m-%d %H:%M')
+
+        # Calculate skip rate
+        total_interactions = stats['total_plays'] + stats['skips']
+        skip_rate = (stats['skips'] / total_interactions * 100) if total_interactions > 0 else 0
+
+        # Create stats display using LayoutView
+        view = LayoutView()
+
+        # Try to get album art
+        album_art = None
+        album_art_file = None
+        try:
+            audio = MP3(song_info['file_path'], ID3=ID3)
+            if 'APIC:' in audio:
+                album_art_data = audio['APIC:'].data
+                album_art_file = discord.File(BytesIO(album_art_data), filename="album_art.jpg")
+                album_art = discord.ui.Thumbnail(media=album_art_file)
+        except Exception as e:
+            logger.warning(f"Could not extract album art for stats: {e}")
+
+        stats_container = Container()
+        stats_container.add_item(Section(
+            TextDisplay(f"📊 **Song Statistics**"),
+            TextDisplay(f"### {song_info['title']}"),
+            TextDisplay(f"👤 {song_info['artist']}"),
+            accessory=album_art
+        ))
+
+        # Stats details - show new accurate stats
+        completion_rate = (stats['completed_plays'] / stats['started_plays'] * 100) if stats['started_plays'] > 0 else 0
+
+        stats_container.add_item(Section(
+            TextDisplay("**Play Statistics**"),
+            TextDisplay(f"🎵 Started Plays: **{stats['started_plays']}**"),
+            TextDisplay(f"✅ Completed Plays: **{stats['completed_plays']}** ({completion_rate:.1f}%)"),
+            TextDisplay(f"⏭️ Skipped Plays: **{stats['skipped_plays']}**"),
+            TextDisplay(f"📋 Total Queued: **{stats['queued_total']}** ({stats['queued_priority']} priority, {stats['queued_regular']} regular)"),
+        ))
+
+        # Time statistics
+        minutes_avg = int(avg_duration // 60)
+        seconds_avg = int(avg_duration % 60)
+        total_hours = stats['total_play_time'] / 3600
+
+        stats_container.add_item(Section(
+            TextDisplay("**Time Statistics**"),
+            TextDisplay(f"🕒 First Played: **{first_played}**"),
+            TextDisplay(f"🕒 Last Played: **{last_played}**"),
+            TextDisplay(f"⏱️ Average Duration: **{minutes_avg}:{seconds_avg:02d}**"),
+            TextDisplay(f"📈 Total Play Time: **{total_hours:.1f} hours**"),
+        ))
+
+        # User statistics
+        top_users = sorted(stats['request_users'].items(), key=lambda x: x[1], reverse=True)[:5]
+        if top_users:
+            user_stats = []
+            for user_id, count in top_users:
+                try:
+                    user = await self.bot.fetch_user(int(user_id))
+                    user_stats.append(f"{user.display_name}: {count}")
+                except:
+                    user_stats.append(f"User {user_id}: {count}")
+
+            stats_container.add_item(Section(
+                TextDisplay("**Top Requesters**"),
+                *[TextDisplay(f"👤 {stat}") for stat in user_stats[:3]],  # Limit to 3 users
+            ))
+
+        view.add_item(stats_container)
+
+        # Send the view with album art file if it exists
+        if album_art_file is not None:
+            await interaction.followup.send(view=view, file=album_art_file)
+        else:
+            await interaction.followup.send(view=view)
+
+    @app_commands.command(name="topplayed", description="Show most played songs")
+    async def topplayed(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        if not self.song_stats:
+            await interaction.response.send_message("No song statistics available yet.", ephemeral=True)
+            return
+
+        # Sort songs by started plays (accurate play count)
+        sorted_songs = sorted(self.song_stats.items(), key=lambda x: x[1]['started_plays'], reverse=True)[:10]
+
+        # Create top played display using LayoutView
+        view = LayoutView()
+
+        top_container = Container()
+        top_container.add_item(TextDisplay("🏆 **Most Played Songs**"))
+        top_container.add_item(TextDisplay("Top 10 songs by total play count"))
+
+        for i, (file_path, stats) in enumerate(sorted_songs, 1):
+            # Find song info from cache
+            song_info = None
+            for song in self.song_cache:
+                if song['file_path'] == file_path:
+                    song_info = song
+                    break
+
+            if song_info:
+                # Calculate skip rate
+                total_interactions = stats['total_plays'] + stats['skips']
+                skip_rate = (stats['skips'] / total_interactions * 100) if total_interactions > 0 else 0
+
+                top_container.add_item(TextDisplay(f"#{i} **{song_info['title']}**"))
+                top_container.add_item(TextDisplay(f"👤 {song_info['artist']} • 🎵 {stats['started_plays']} plays"))
+
+        view.add_item(top_container)
+        await interaction.followup.send(view=view)
+
+    @app_commands.command(name="mostskipped", description="Show most skipped songs")
+    async def mostskipped(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        if not self.song_stats:
+            await interaction.followup.send("No song statistics available yet.", ephemeral=True)
+            return
+
+        # Filter songs with at least 3 started plays and sort by skip rate
+        songs_with_skips = []
+        for file_path, stats in self.song_stats.items():
+            total_interactions = stats['started_plays'] + stats['skipped_plays']
+            if total_interactions >= 3:  # Minimum threshold
+                skip_rate = stats['skipped_plays'] / total_interactions
+                songs_with_skips.append((file_path, stats, skip_rate))
+
+        if not songs_with_skips:
+            await interaction.followup.send("No songs with sufficient data to calculate skip rates.", ephemeral=True)
+            return
+
+        # Sort by skip rate (descending)
+        sorted_songs = sorted(songs_with_skips, key=lambda x: x[2], reverse=True)[:10]
+
+        # Create most skipped display using LayoutView
+        view = LayoutView()
+
+        skip_container = Container()
+        skip_container.add_item(TextDisplay("😬 **Most Skipped Songs**"))
+        skip_container.add_item(TextDisplay("Top 10 songs by skip rate (minimum 3 interactions)"))
+
+        for i, (file_path, stats, skip_rate) in enumerate(sorted_songs, 1):
+            # Find song info from cache
+            song_info = None
+            for song in self.song_cache:
+                if song['file_path'] == file_path:
+                    song_info = song
+                    break
+
+            if song_info:
+                total_interactions = stats['started_plays'] + stats['skipped_plays']
+                skip_container.add_item(TextDisplay(f"#{i} **{song_info['title']}**"))
+                skip_container.add_item(TextDisplay(f"👤 {song_info['artist']} • ⏭️ {skip_rate*100:.1f}% skipped • 🎵 {total_interactions} total"))
+
+        view.add_item(skip_container)
+        await interaction.followup.send(view=view)
 
 
 async def setup(bot: commands.Bot):
