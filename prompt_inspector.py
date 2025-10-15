@@ -10,7 +10,16 @@ from context_menus import image_metadata_context_menu
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix=';', intents=intents)
+bot = commands.Bot(
+    command_prefix=';',
+    intents=intents,
+    # Add voice permissions for music functionality
+    permissions=discord.Permissions(
+        connect=True,      # Connect to voice channels
+        speak=True,        # Speak in voice channels
+        use_voice_activation=True  # Use voice activation (optional but recommended)
+    )
+)
 
 @bot.event
 async def on_ready():
