@@ -13,12 +13,24 @@ from discord import Embed, ButtonStyle, Message, Attachment, File, RawReactionAc
 from discord.ext import commands
 from discord.ui import View, button
 from PIL import Image
+from settings import logger
 
 SCAN_LIMIT_BYTES = int(os.getenv('SCAN_LIMIT_BYTES', '41943040'))  # Default 40 MB
 METADATA_EMOJI = os.getenv('METADATA_EMOJI', '🔎')
 GUESS_EMOJI = os.getenv('GUESS_EMOJI', '❔')
 GRADIO_BACKEND = os.getenv('GRADIO_BACKEND', "https://yoinked-da-nsfw-checker.hf.space/")
-GRADCL = gradio_client.Client(GRADIO_BACKEND)
+GRADCL = None  # Lazy initialization
+
+def get_gradio_client():
+    """Lazy initialization of Gradio client"""
+    global GRADCL
+    if GRADCL is None:
+        try:
+            GRADCL = gradio_client.Client(GRADIO_BACKEND)
+        except Exception as e:
+            logger.info(f"Failed to load Gradio API: {e}")
+            GRADCL = None
+    return GRADCL
 
 def comfyui_get_data(dat):
     """Extract prompt/loras/checkpoints from comfy metadata"""
@@ -272,13 +284,17 @@ class MetadataCog(commands.Cog):
                 user_dm = await self.bot.get_user(ctx.user_id).create_dm()
                 embed = Embed(title="Predicted Prompt", color=message.author.color)
                 embed = embed.set_image(url=attachments[0].url)
-                predicted = GRADCL.predict(gradio_client.file(attachments[0].url),
-                                       "chen-evangelion",
-                                       0.45, True, True, api_name="/classify")[1]
-                predicted = f"```\n{predicted}\n```"
-                embed.add_field(name="DashSpace", value=predicted)
-                predicted = predicted.replace(" ", ",").replace("-", " ").replace(",", ", ")
-                embed.add_field(name="CommaSpace", value=predicted)
+                gradcl = get_gradio_client()
+                if gradcl:
+                    predicted = gradcl.predict(gradio_client.file(attachments[0].url),
+                                           "chen-evangelion",
+                                           0.45, True, True, api_name="/classify")[1]
+                    predicted = f"```\n{predicted}\n```"
+                    embed.add_field(name="DashSpace", value=predicted)
+                    predicted = predicted.replace(" ", ",").replace("-", " ").replace(",", ", ")
+                    embed.add_field(name="CommaSpace", value=predicted)
+                else:
+                    embed.add_field(name="Error", value="Gradio API not available")
                 await user_dm.send(embed=embed)
             except Exception as e:
                 print(e)
