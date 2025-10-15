@@ -63,15 +63,42 @@ class OnMessageCog(commands.Cog):
         """Core AI response generation. Handles both text and multimodal prompts."""
         try:
             # Send the prompt content (string or list) to the AI
+            #logger.info(f"prompt_content: {prompt_content}")
             response = CHAT.send_message(prompt_content)
-            
-            # Process the response text
-            if len(response.text) > 2000:
-                await self.split_long_response(response.text, message)
-            else:
-                await message.reply(response.text)
-            
-            logger.info(f"Responded to {message.author} with {len(response.text)} chars")
+            #logger.info(f"response: {response}")
+            #history = CHAT.get_history()
+            #logger.info(f"Chat history: {history}")
+
+            content = response.candidates[0].content
+            response_text = ""
+            image_files = []
+
+            for part in content.parts:
+                if part.text is not None:
+                    response_text += part.text
+                elif part.inline_data is not None:
+                    # Image data is already bytes, no need to decode base64
+                    image_data = part.inline_data.data
+                    image = Image.open(BytesIO(image_data))
+                    # Save or process the image as needed
+                    buffered = BytesIO()
+                    image.save(buffered, format="PNG")
+                    buffered.seek(0)
+                    file = discord.File(buffered, filename="response_image.png")
+                    image_files.append(file)
+
+            # Send response with both text and images together
+            if response_text or image_files:
+                if len(response_text) > 2000:
+                    # If text is too long, send images first, then split text
+                    for file in image_files:
+                        await message.reply(file=file)
+                    await self.split_long_response(response_text, message)
+                else:
+                    # Send text and images together in one message
+                    await message.reply(content=response_text, files=image_files if image_files else None)
+
+            #logger.info(f"Responded to {message.author} with {len(response_text)} chars and {len(image_files)} images")
         except Exception as e:
             logger.error(f"AI response error: {e}")
             await message.reply("Sorry, I encountered an error processing your request.")
@@ -185,7 +212,10 @@ class OnMessageCog(commands.Cog):
                     pass
 
             # Prepare the base text prompt
-            base_prompt = f"{message.author.mention}: {message.content}{context}"
+            base_prompt = ""
+            if CHAT.get_history() is None:
+                base_prompt = f"You are a discord bot named Prompt Inspector. You help users get meta data from images and answer general questions. Be concise and clear in your responses.\n\n"
+            base_prompt += f"User - {message.author.mention}: {message.content}{context}"
             
             # Default content to send is the base text prompt
             content_to_send = base_prompt
@@ -195,7 +225,10 @@ class OnMessageCog(commands.Cog):
                 multimodal_content = await self.process_attachments(message)
                 # If an image was successfully processed, use that content
                 if multimodal_content:
+                    logger.info(f"Processing multimodal input from {message.author}")
                     content_to_send = multimodal_content
+                else:
+                    logger.info(f"No valid image attachments found in message {message.id} from {message.author}. Proceeding with text only.")
             
             # Generate the response using the determined content (text or multimodal)
             await self.generate_ai_response(content_to_send, message)
