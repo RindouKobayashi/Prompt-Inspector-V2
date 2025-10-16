@@ -859,6 +859,21 @@ class MusicCog(commands.Cog):
             await self.update_queue_message(interaction)
 
         elif action == 'stop':
+            # Record play duration for currently playing song before stopping
+            if guild_id in self.now_playing and guild_id in self.current_play_start:
+                song_info = self.now_playing[guild_id]
+                play_duration = asyncio.get_event_loop().time() - self.current_play_start[guild_id]
+
+                # Always record play duration and session (even for stopped songs)
+                self.record_play_duration(song_info['file_path'], play_duration)
+
+                # Record appropriate event type - treat stop as a special case
+                current_type = self.current_queue_type.get(guild_id, 'regular')
+                # For stop, we don't count it as completed or skipped, but we record the duration
+                # This is a new event type we might want to track separately
+
+                del self.current_play_start[guild_id]
+
             # Clear all queues and disconnect
             if guild_id in self.priority_queues:
                 del self.priority_queues[guild_id]
@@ -931,6 +946,21 @@ class MusicCog(commands.Cog):
             await self.update_queue_message(interaction)
 
         elif action == 'clear':
+            # Record play duration for currently playing song before clearing queues
+            if guild_id in self.now_playing and guild_id in self.current_play_start:
+                song_info = self.now_playing[guild_id]
+                play_duration = asyncio.get_event_loop().time() - self.current_play_start[guild_id]
+
+                # Always record play duration and session (even for cleared songs)
+                self.record_play_duration(song_info['file_path'], play_duration)
+
+                # Record appropriate event type - treat clear as a special case
+                current_type = self.current_queue_type.get(guild_id, 'regular')
+                # For clear, we don't count it as completed or skipped, but we record the duration
+                # This is a new event type we might want to track separately
+
+                del self.current_play_start[guild_id]
+
             # Clear all songs from both priority and regular queues
             cleared_anything = False
             if guild_id in self.priority_queues:
