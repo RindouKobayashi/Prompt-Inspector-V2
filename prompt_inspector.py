@@ -49,7 +49,43 @@ async def shutdown_tasks():
     """
     logger.warning("Bot is shutting down...")
 
-    # Do stuff here before the bot shuts down
+    # Gracefully disconnect from all voice channels
+    disconnect_tasks = []
+
+    for guild in bot.guilds:
+        voice_client = guild.voice_client
+        if voice_client and voice_client.is_connected():
+            # Create a task for each disconnect to run concurrently
+            task = asyncio.create_task(disconnect_voice_client(guild, voice_client))
+            disconnect_tasks.append(task)
+
+    # Wait for all disconnects to complete concurrently
+    if disconnect_tasks:
+        try:
+            await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"Error during voice disconnections: {e}")
+
+    # Do other cleanup here before the bot shuts down
+
+async def disconnect_voice_client(guild, voice_client):
+    """Helper function to disconnect a single voice client"""
+    try:
+        # Stop any currently playing audio
+        if voice_client.is_playing():
+            voice_client.stop()
+
+        # Disconnect from voice channel with timeout
+        try:
+            # Use asyncio.wait_for with a 2-second timeout
+            await asyncio.wait_for(voice_client.disconnect(), timeout=2.0)
+        except asyncio.TimeoutError:
+            # Timeout is expected during shutdown, just continue
+            pass
+        except Exception as e:
+            logger.error(f"Error disconnecting from {guild.name}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in disconnect_voice_client for {guild.name}: {e}")
 
 async def main():
     try:
