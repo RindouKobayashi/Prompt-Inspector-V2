@@ -11,3 +11,6 @@ google-genai
 discord-voice
 PyNaCl
 mutagen
+kokoro
+soundfile
+numpy
