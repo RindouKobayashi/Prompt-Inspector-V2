@@ -245,6 +245,16 @@ class MusicCog(commands.Cog):
             # No permission to change presence, skip silently
             pass
 
+        # Update voice channel status if bot has permission
+        try:
+            voice_channel = interaction.guild.voice_client.channel
+            if voice_channel.permissions_for(interaction.guild.get_member(self.bot.user.id)).manage_channels:
+                status_text = f"🎵 {song_info['title']} - {song_info['artist']}"
+                await voice_channel.edit(status=status_text)
+        except (discord.Forbidden, AttributeError):
+            # No permission to edit channel status or no voice channel, skip silently
+            pass
+
         # Voice channel monitoring is now handled by event listeners
 
         # Create music player interface using LayoutView
@@ -394,6 +404,15 @@ class MusicCog(commands.Cog):
                 # No more songs, clear now playing and disconnect from voice channel
                 if guild_id in self.now_playing:
                     del self.now_playing[guild_id]
+
+                # Clear voice channel status if bot has permission
+                try:
+                    voice_channel = interaction.guild.voice_client.channel
+                    if voice_channel.permissions_for(interaction.guild.get_member(self.bot.user.id)).manage_channels:
+                        await voice_channel.edit(status=None)
+                except (discord.Forbidden, AttributeError):
+                    # No permission to edit channel status or no voice channel, skip silently
+                    pass
 
                 # Disconnect from voice channel after a short delay
                 if interaction.guild.voice_client:
@@ -882,6 +901,15 @@ class MusicCog(commands.Cog):
             if guild_id in self.now_playing:
                 del self.now_playing[guild_id]
 
+            # Clear voice channel status if bot has permission
+            try:
+                voice_channel = interaction.guild.voice_client.channel
+                if voice_channel.permissions_for(interaction.guild.get_member(self.bot.user.id)).manage_channels:
+                    await voice_channel.edit(status=None)
+            except (discord.Forbidden, AttributeError):
+                # No permission to edit channel status or no voice channel, skip silently
+                pass
+
             # Stop current song and disconnect
             if interaction.guild.voice_client:
                 if interaction.guild.voice_client.is_playing():
@@ -1209,12 +1237,36 @@ class MusicCog(commands.Cog):
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         """Handle voice channel state changes for music management"""
-        # Ignore bot state changes
-        if member.bot:
-            return
-
         guild = member.guild
         voice_client = guild.voice_client
+
+        # Check if bot disconnected (kicked, manually disconnected, etc.)
+        if member == guild.me and before.channel is not None and after.channel is None:
+            # Bot was disconnected from voice channel
+            # Clear voice channel status if bot has permission (before disconnecting)
+            try:
+                if before.channel.permissions_for(guild.get_member(self.bot.user.id)).manage_channels:
+                    await before.channel.edit(status=None)
+            except (discord.Forbidden, AttributeError):
+                # No permission to edit channel status or channel no longer accessible, skip silently
+                pass
+
+            # Clear Rich Presence when disconnected
+            try:
+                await self.bot.change_presence(activity=None)
+            except discord.Forbidden:
+                # No permission to change presence, skip silently
+                pass
+
+            # Clear now playing for this guild
+            if guild.id in self.now_playing:
+                del self.now_playing[guild.id]
+
+            return
+
+        # Ignore other bot state changes
+        if member.bot:
+            return
 
         # Only care if bot is connected to voice
         if not voice_client or not voice_client.is_connected():
@@ -1323,6 +1375,14 @@ class MusicCog(commands.Cog):
             if (hasattr(voice_client, 'alone_since') and
                 voice_client.is_connected() and
                 len([m for m in voice_client.channel.members if not m.bot]) == 0):
+
+                # Clear voice channel status if bot has permission
+                try:
+                    if voice_client.permissions_for(guild.get_member(self.bot.user.id)).manage_channels:
+                        await voice_client.edit(status=None)
+                except (discord.Forbidden, AttributeError):
+                    # No permission to edit channel status or no voice channel, skip silently
+                    pass
 
                 await voice_client.disconnect()
                 logger.info(f"Disconnected from {guild.name} - alone for {self.ALONE_TIMEOUT} seconds")
