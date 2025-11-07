@@ -1,5 +1,6 @@
 import discord
 import random
+from datetime import datetime, timezone, timedelta
 from discord.ext import commands, tasks
 from settings import logger
 
@@ -11,35 +12,31 @@ class PresenceCog(commands.Cog):
         self.guild_count = 0
         self.current_status = None
         self.start_time = discord.utils.utcnow()
+        # GTA 6 release date: November 19, 2026, 00:00 EST (UTC-5)
+        self.release_date = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
         self.change_status.start()
 
     def cog_unload(self):
         self.change_status.cancel()
 
     def get_statuses(self):
-        """Returns dynamic statuses including bot info"""
-        all_statuses = [
-            (discord.ActivityType.playing, "with the API"),
-            (discord.ActivityType.watching, f"{self.guild_count} servers"),
-            (discord.ActivityType.listening, "user requests"),
-            (discord.ActivityType.competing, "the Turing test"),
-            (discord.ActivityType.playing, "Inspector Gadget"),
-            (discord.ActivityType.watching, "pixels render"),
-            (discord.ActivityType.watching, f"{len(self.bot.users)} users"),
-            (discord.ActivityType.listening, "slash commands"),
-            (discord.ActivityType.playing, "with prompts"),
-            (discord.ActivityType.watching, "for new features"),
-            (discord.ActivityType.listening, f"Ping: {round(self.bot.latency * 1000)}ms"),
-            (discord.ActivityType.watching, f"Uptime: {round((discord.utils.utcnow() - self.start_time).total_seconds() / 60)} minutes"),
-        ]
-        # Filter out current status if it exists
-        if self.current_status:
-            return [s for s in all_statuses if s != self.current_status]
-        return all_statuses
+        """Returns the GTA 6 countdown status"""
+        now = datetime.now(timezone.utc)
+        time_remaining = self.release_date - now
 
-    @tasks.loop(seconds=12)
+        if time_remaining.total_seconds() <= 0:
+            return [(discord.ActivityType.playing, "GTA 6 is out!")]
+
+        days = time_remaining.days
+        hours, remainder = divmod(time_remaining.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        countdown_text = f"GTA 6 in {days}d {hours}h {minutes}m"
+        return [(discord.ActivityType.watching, countdown_text)]
+
+    @tasks.loop(minutes=1)
     async def change_status(self):
-        """Cycles through dynamic statuses without repeating."""
+        """Updates the countdown status every minute."""
         try:
             # Check if music is currently playing OR if bot is alone in VC (don't override music Rich Presence)
             should_skip_presence = False
@@ -67,13 +64,12 @@ class PresenceCog(commands.Cog):
                 logger.debug("Music playing or bot alone in VC, skipping presence change")
                 return
 
-            self.guild_count = len(self.bot.guilds)
             available_statuses = self.get_statuses()
             if not available_statuses:
                 return
 
-            self.current_status = random.choice(available_statuses)
-            activity_type, status_text = self.current_status
+            # Since there's only one status now, always use it
+            activity_type, status_text = available_statuses[0]
             activity = discord.Activity(type=activity_type, name=status_text)
             await self.bot.change_presence(activity=activity)
             logger.debug(f"Changed presence to: {activity_type.name} {status_text}")
